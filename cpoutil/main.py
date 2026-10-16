@@ -1,5 +1,6 @@
 """Command-line utility for Co-Packaged Optics devices."""
 
+from contextlib import contextmanager
 import json
 import math
 import re
@@ -8,7 +9,10 @@ import sys
 import click
 from tabulate import tabulate
 
+from sonic_py_common import multi_asic
 from sonic_platform_base.sonic_xcvr.cpo.cpo_base import CpoBase
+from sonic_platform_base.sonic_xcvr.optoe_eeprom_rw import OptoeEepromReadWriteMixin
+from sonic_platform_base.sonic_xcvr.xcvr_eeprom import XcvrEeprom
 from utilities_common import platform_sfputil_helper
 from utilities_common.platform_sfputil_helper import (
     CMIS_INFO_FIELD_MAP,
@@ -127,11 +131,11 @@ def load_current_port_config():
     if platform_sfputil_helper.platform_sfputil is None:
         platform_sfputil_helper.load_platform_sfputil()
     platform_sfputil_helper.platform_sfputil_read_porttab_mappings()
+    # Read each namespace once instead of discovering it for every port.
+    port_table = multi_asic.get_port_table()
     current_port_config = {}
     for port in platform_sfputil_helper.get_logical_list():
-        lanes = platform_sfputil_helper.get_value_from_db_by_field(
-            "CONFIG_DB", "PORT", "lanes", port
-        )
+        lanes = port_table.get(port, {}).get("lanes")
         current_port_config[port] = {
             "index": platform_sfputil_helper.get_validated_physical_port_list(port),
             "lanes": _parse_port_lanes(lanes, port),
@@ -802,6 +806,50 @@ def _append_additional_dom_values(lines, values, displayed_keys):
             ))
 
 
+@contextmanager
+def _dom_eeprom_snapshot():
+    """Reuse successful Optoe bytes only for this read-only DOM invocation.
+
+    Absolute offsets already encode bank/page selection. Cache only the
+    unmodified community Optoe reader: custom platform readers may translate
+    offsets themselves and must retain their existing behavior.
+    """
+    images = {}
+    readers = {}
+
+    def attach(endpoint, api):
+        eeprom = getattr(api, "xcvr_eeprom", None)
+        if not isinstance(eeprom, XcvrEeprom) or id(eeprom) in readers:
+            return
+        reader = eeprom.reader
+        if (not isinstance(endpoint, OptoeEepromReadWriteMixin)
+                or getattr(reader, "__self__", None) is not endpoint
+                or getattr(reader, "__func__", None) is not OptoeEepromReadWriteMixin.read_eeprom):
+            return
+        path = endpoint.get_eeprom_path()
+        if not isinstance(path, str) or not path:
+            return
+        image = images.setdefault(path, {})
+
+        def read(offset, size):
+            addresses = range(offset, offset + size)
+            if size > 0 and all(address in image for address in addresses):
+                return bytearray(image[address] for address in addresses)
+            data = reader(offset, size)
+            if isinstance(data, (bytes, bytearray)) and size > 0 and len(data) == size:
+                image.update(zip(addresses, data))
+            return data
+
+        readers[id(eeprom)] = (eeprom, reader)
+        eeprom.reader = read
+
+    try:
+        yield attach
+    finally:
+        for eeprom, reader in readers.values():
+            eeprom.reader = reader
+
+
 def _read_dom_section(failures, endpoint, section, read):
     """Read one DOM section at the platform API boundary.
 
@@ -839,19 +887,14 @@ def _format_interface_dom(port_name, record):
 
 
 def _local_oe_bank(mapping):
-    """Return the OE-local CMIS bank of one topology interface.
-
-    Community topologies declare OE-local banks. Legacy topologies may number
-    banks across all OEs (OE n bank b as n * bank_count + b), so the declared
-    bank is reduced modulo the OE's advertised bank count. The declared bank is
-    never replaced by its position among the mapped banks.
-    """
+    """Validate and return the OE-local CMIS bank declared by the HLD topology."""
     cpo = cpo_object_map[OPTICAL_ENGINE].get(mapping.oe_name)
     if cpo is None:
-        raise CpoCommandError(
-            "No CPO object is available for '{}'".format(mapping.oe_name)
-        )
-    return mapping.oe_bank % _get_oe_bank_count(mapping.oe_name, cpo)
+        raise CpoCommandError("No CPO object is available for '{}'".format(mapping.oe_name))
+    bank_count = _get_oe_bank_count(mapping.oe_name, cpo)
+    if mapping.oe_bank < 0 or mapping.oe_bank >= bank_count:
+        raise CpoCommandError("Invalid bank {} for '{}'".format(mapping.oe_bank, mapping.oe_name))
+    return mapping.oe_bank
 
 
 def _interface_mapping_record(logical_port):
@@ -877,19 +920,18 @@ def _interface_mapping_record(logical_port):
     }
 
 
-def _application_speed(advertisements, application):
-    if not application or not isinstance(advertisements, dict):
+def _format_selected_application(advertisements, application):
+    """Keep the AppSel and full public Host/Media interface descriptions."""
+    if application is None or application == "N/A":
         return "N/A"
     details = advertisements.get(application)
     if details is None:
-        details = advertisements.get(str(application), {})
+        details = advertisements.get(str(application))
     if not isinstance(details, dict):
-        return "N/A"
-    interface = details.get("host_electrical_interface_id", "")
-    match = re.search(r"(\d+(?:\.\d+)?)G", str(interface), re.IGNORECASE)
-    if not match:
-        return "N/A"
-    return int(float(match.group(1)) * 1000)
+        return "{}: N/A".format(application)
+    host = details.get("host_electrical_interface_id", "N/A")
+    media = details.get("module_media_interface_id", "N/A")
+    return "{}: {} / {}".format(application, host, media)
 
 
 def _format_map_table(mappings):
@@ -1047,13 +1089,14 @@ def print_records(records, json_output, headers=("Resource", "Value"),
     click.echo(tabulate(rows, table_headers, **options))
 
 
-def print_speed_records(records, json_output):
+def print_application_records(records, json_output):
     if json_output:
         click.echo(_json_records(records))
         return
 
     rows = []
     for interface, values in records.items():
+        advertisements = values.get("Application Advertisement", {})
         configured = values.get("Application Select Controls", {})
         active = values.get("Active Application Control Set", {})
         lanes = sorted(
@@ -1063,16 +1106,16 @@ def print_speed_records(records, json_output):
             rows.append((
                 interface,
                 _display_field(lane),
-                configured.get(lane, "N/A"),
-                active.get(lane, "N/A"),
+                _format_selected_application(advertisements, configured.get(lane)),
+                _format_selected_application(advertisements, active.get(lane)),
             ))
     click.echo(tabulate(
         rows,
         (
             "Interface",
             "Lane",
-            "Configured Speed (Mbps)",
-            "Active Speed (Mbps)",
+            "Configured Application",
+            "Active Application",
         ),
         tablefmt="simple",
     ))
@@ -1315,37 +1358,40 @@ def show_interface_dom(port, json_output):
     output = []
     failed_ports = []
     try:
-        for port_name, _, cpo in get_port_cpo_objects(port):
-            present = get_cpo_presence(cpo, port_name)
-            record = {"present": present, "oe": {}, "els": {}}
-            records[port_name] = record
-            if not present:
-                output.append(_format_interface_dom(port_name, record))
-                continue
-            oe_api = get_oe_api(cpo, port_name)
-            els_api = get_els_api(cpo, port_name)
+        with _dom_eeprom_snapshot() as attach_snapshot:
+            for port_name, _, cpo in get_port_cpo_objects(port):
+                present = get_cpo_presence(cpo, port_name)
+                record = {"present": present, "oe": {}, "els": {}}
+                records[port_name] = record
+                if not present:
+                    output.append(_format_interface_dom(port_name, record))
+                    continue
+                oe_api = get_oe_api(cpo, port_name)
+                els_api = get_els_api(cpo, port_name)
+                attach_snapshot(cpo.oe, oe_api)
+                attach_snapshot(cpo.elsfp, els_api)
 
-            failures = []
-            record["oe"] = {
-                "info": _read_dom_section(failures, "OE", "info", oe_api.get_transceiver_info),
-                "dom": _read_dom_section(failures, "OE", "dom", oe_api.get_transceiver_dom_real_value),
-                "thresholds": _read_dom_section(
-                    failures, "OE", "thresholds", oe_api.get_transceiver_threshold_info),
-            }
-            els_info = _read_dom_section(failures, "ELS", "info", els_api.get_elsfp_info)
-            record["els"] = {
-                "info": els_info,
-                "dom": _filter_els_dom_lanes(
-                    _read_dom_section(failures, "ELS", "dom", els_api.get_elsfp_dom_real_value),
-                    _get_els_lane_count(els_info),
-                ),
-                "thresholds": _read_dom_section(
-                    failures, "ELS", "thresholds", els_api.get_elsfp_threshold_info),
-            }
-            if failures:
-                record["read_errors"] = failures
-                failed_ports.append("{} ({})".format(port_name, ", ".join(failures)))
-            output.append(_format_interface_dom(port_name, record))
+                failures = []
+                record["oe"] = {
+                    "info": _read_dom_section(failures, "OE", "info", oe_api.get_transceiver_info),
+                    "dom": _read_dom_section(failures, "OE", "dom", oe_api.get_transceiver_dom_real_value),
+                    "thresholds": _read_dom_section(
+                        failures, "OE", "thresholds", oe_api.get_transceiver_threshold_info),
+                }
+                els_info = _read_dom_section(failures, "ELS", "info", els_api.get_elsfp_info)
+                record["els"] = {
+                    "info": els_info,
+                    "dom": _filter_els_dom_lanes(
+                        _read_dom_section(failures, "ELS", "dom", els_api.get_elsfp_dom_real_value),
+                        _get_els_lane_count(els_info),
+                    ),
+                    "thresholds": _read_dom_section(
+                        failures, "ELS", "thresholds", els_api.get_elsfp_threshold_info),
+                }
+                if failures:
+                    record["read_errors"] = failures
+                    failed_ports.append("{} ({})".format(port_name, ", ".join(failures)))
+                output.append(_format_interface_dom(port_name, record))
     except (NotImplementedError, AttributeError) as exc:
         raise click.ClickException(
             "This functionality is not implemented: {}".format(exc)
@@ -1392,11 +1438,20 @@ def show_interface_tx_disable(port, json_output):
     )
 
 
-@show_interface.command("speed")
+@show_interface.group("speed")
+def show_interface_speed():
+    """Display CPO interface application settings."""
+
+
+@show_interface_speed.command("application")
 @click.argument("port", required=False)
 @output_option
-def show_interface_speed(port, json_output):
-    """Display configured and active speed per lane."""
+def show_interface_speed_application(port, json_output):
+    """Display configured and active Application selections per lane.
+
+    Each table entry is AppSel: Host interface / Media interface. JSON retains
+    the complete public Application Advertisement and the per-lane AppSel IDs.
+    """
     from sonic_platform_base.sonic_xcvr.fields import consts
 
     records = {}
@@ -1414,20 +1469,17 @@ def show_interface_speed(port, json_output):
             configured = []
             active = []
             for lane in range(api.NUM_CHANNELS):
-                configured.append(_application_speed(
-                    advertisements, api.get_application(lane)
-                ))
+                configured.append(api.get_application(lane))
                 active_application = active_applications.get(
                     "{}{}".format(
                         consts.ACTIVE_APSEL_HOSTLANE, lane + 1
                     ),
                     "N/A",
                 )
-                active.append(_application_speed(
-                    advertisements, active_application
-                ))
+                active.append(active_application)
             lane_positions = get_cpo_lane_positions(logical_port)
             records[port_name] = {
+                "Application Advertisement": advertisements,
                 "Application Select Controls": _select_lane_values(
                     configured, lane_positions
                 ),
@@ -1441,7 +1493,7 @@ def show_interface_speed(port, json_output):
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
-    print_speed_records(records, json_output)
+    print_application_records(records, json_output)
 
 
 @show_interface.command("lane-status")

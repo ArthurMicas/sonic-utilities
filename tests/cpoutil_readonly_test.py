@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import json
 import os
 import sys
@@ -54,18 +55,45 @@ def public_els_threshold_api():
 
 
 CPO_DATA = {
-    "oes": {"oe0": {"index": 0, "oe_cmis_path": "/sys/oe0/"}},
-    "elss": {"els0": {"index": 0}},
+    "devices": {
+        "oe0": {
+            "device_type": "optical_engine",
+            "max_banks": 1,
+            "asic_lanes": [
+                1,
+                2
+            ]
+        },
+        "els0": {
+            "device_type": "external_laser_source",
+            "laser_to_asic_lane_mapping": {}
+        }
+    },
     "interfaces": {
         "Ethernet0": {
             "index": "1,1",
             "lanes": "1,2",
-            "oe_id": 0,
-            "oe_bank_id": 0,
-            "els_id": 0,
-            "laser_ids": [0, 1],
+            "associated_devices": [
+                {
+                    "device_id": "oe0",
+                    "bank": 0
+                },
+                {
+                    "device_id": "els0"
+                }
+            ]
         }
     },
+    "platform_data": {
+        "interfaces": {
+            "Ethernet0": {
+                "laser_ids": [
+                    0,
+                    1
+                ]
+            }
+        }
+    }
 }
 
 
@@ -86,8 +114,18 @@ class FakeApi:
 
     def get_application_advertisement(self):
         return {
-            1: {"host_electrical_interface_id": "400GAUI-4-L"},
-            2: {"host_electrical_interface_id": "200GAUI-4"},
+            1: {
+                "host_electrical_interface_id": "400GAUI-4-L C2M (Annex 120G)",
+                "module_media_interface_id": "400G-FR4/400GBASE-FR4 (Cl 151)",
+                "host_lane_count": 4, "media_lane_count": 4,
+                "host_lane_assignment_options": 17, "media_lane_assignment_options": 17,
+            },
+            2: {
+                "host_electrical_interface_id": "CAUI-4 C2M (Annex 83E) with RS(528,514) FEC",
+                "module_media_interface_id": "100G CWDM4 MSA Spec",
+                "host_lane_count": 4, "media_lane_count": 4,
+                "host_lane_assignment_options": 17, "media_lane_assignment_options": 17,
+            },
         }
 
     def get_application(self, lane):
@@ -459,29 +497,59 @@ class TestDirectPlatformApiCommands(object):
             "Ethernet0": {"lane00": False, "lane01": True}
         }
 
-    def test_interface_speed_uses_existing_cmis_methods(self):
+    def test_interface_application_preserves_public_api_values(self):
         result = invoke([
-            "show", "interface", "speed", "Ethernet0", "--json"
-        ])
-        values = json.loads(result.output)["Ethernet0"]
-        assert values["Application Select Controls"] == {
-            "lane00": 400000,
-            "lane01": 200000,
-        }
-        assert values["Active Application Control Set"] == {
-            "lane00": 200000,
-            "lane01": 400000,
-        }
-
-    def test_breakout_speed_does_not_require_els_lane_mapping(self):
-        result = invoke([
-            "show", "interface", "speed", "Ethernet1", "--json"
+            "show", "interface", "speed", "application", "Ethernet0", "--json"
         ])
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output)["Ethernet1"] == {
-            "Application Select Controls": {"lane01": 200000},
-            "Active Application Control Set": {"lane01": 400000},
+        values = json.loads(result.output)["Ethernet0"]
+        assert values["Application Select Controls"] == {"lane00": 1, "lane01": 2}
+        assert values["Active Application Control Set"] == {"lane00": 2, "lane01": 1}
+        assert values["Application Advertisement"] == {
+            str(key): value for key, value in self.cpo.api.get_application_advertisement().items()
         }
+
+    def test_application_table_has_four_columns_and_full_interface_names(self):
+        result = invoke(["show", "interface", "speed", "application", "Ethernet0"])
+        assert result.exit_code == 0, result.output
+        assert result.output.splitlines()[0].split("  ")[0] == "Interface"
+        assert "Configured Application" in result.output
+        assert "Active Application" in result.output
+        assert "Configured Speed" not in result.output
+        assert "AppSel" not in result.output.splitlines()[0]
+        for value in self.cpo.api.get_application_advertisement().values():
+            assert value["host_electrical_interface_id"] in result.output
+            assert value["module_media_interface_id"] in result.output
+        assert "1: 400GAUI-4-L C2M (Annex 120G)" in result.output
+        assert "2: CAUI-4 C2M (Annex 83E) with RS(528,514) FEC" in result.output
+
+    def test_breakout_application_does_not_require_els_lane_mapping(self):
+        result = invoke([
+            "show", "interface", "speed", "application", "Ethernet1", "--json"
+        ])
+        assert result.exit_code == 0, result.output
+        values = json.loads(result.output)["Ethernet1"]
+        assert values["Application Select Controls"] == {"lane01": 2}
+        assert values["Active Application Control Set"] == {"lane01": 1}
+        assert values["Application Advertisement"]["2"]["host_electrical_interface_id"] == (
+            "CAUI-4 C2M (Annex 83E) with RS(528,514) FEC"
+        )
+
+    @pytest.mark.parametrize("application", [0, 15])
+    def test_unadvertised_application_keeps_the_selected_id(self, monkeypatch, application):
+        monkeypatch.setattr(self.cpo.api, "get_application", lambda lane: application)
+        result = invoke(["show", "interface", "speed", "application", "Ethernet1"])
+        assert result.exit_code == 0, result.output
+        assert "{}: N/A".format(application) in result.output
+
+    def test_application_with_serialized_advertisement_keys(self, monkeypatch):
+        advertisements = self.cpo.api.get_application_advertisement()
+        monkeypatch.setattr(self.cpo.api, "get_application_advertisement", lambda: {
+            str(key): value for key, value in advertisements.items()
+        })
+        result = invoke(["show", "interface", "speed", "application", "Ethernet1"])
+        assert result.exit_code == 0, result.output
+        assert advertisements[2]["host_electrical_interface_id"] in result.output
 
     def test_interface_lane_status_uses_public_elsfp_api(self):
         result = invoke([
@@ -556,3 +624,158 @@ class TestDirectPlatformApiCommands(object):
         result = invoke(["show", "oe", "status", "99"])
         assert result.exit_code != 0
         assert "Invalid oe index '99'" in result.output
+
+
+class DomOptoeEndpoint(cpoutil.OptoeEepromReadWriteMixin):
+    def __init__(self, path):
+        self.path = str(path)
+
+    def get_eeprom_path(self):
+        return self.path
+
+    def get_api(self):
+        return self.api
+
+
+class DomSnapshotApi:
+    def __init__(self, endpoint):
+        self.xcvr_eeprom = cpoutil.XcvrEeprom(endpoint.read_eeprom, endpoint.write_eeprom, None)
+
+    def get_transceiver_info(self):
+        return {"manufacturer": self.xcvr_eeprom.reader(0, 2).decode()}
+
+    get_elsfp_info = get_transceiver_info
+
+    def get_transceiver_dom_real_value(self):
+        return {"temperature": float(self.xcvr_eeprom.reader(0, 1)[0])}
+
+    get_elsfp_dom_real_value = get_transceiver_dom_real_value
+
+    def get_transceiver_threshold_info(self):
+        return {"temphighalarm": float(self.xcvr_eeprom.reader(1, 1)[0])}
+
+    def get_elsfp_threshold_info(self):
+        return {"temperature_alarm_high": float(self.xcvr_eeprom.reader(1, 1)[0])}
+
+
+class TestDomEepromSnapshot:
+    def endpoint(self, path):
+        endpoint = DomOptoeEndpoint(path)
+        endpoint.api = DomSnapshotApi(endpoint)
+        return endpoint
+
+    def test_global_dom_preserves_output_and_reads_shared_bytes_once(self, monkeypatch, tmp_path):
+        oe_file, els_file = tmp_path / "oe", tmp_path / "els"
+        oe_file.write_bytes(b"AB")
+        els_file.write_bytes(b"CD")
+        cpos = {}
+        endpoints = []
+        for port in range(1, 4):
+            oe, els = self.endpoint(oe_file), self.endpoint(els_file)
+            endpoints.extend([oe, els])
+            cpo = cpoutil.CpoBase(None, oe, els)
+            cpo.get_presence = mock.Mock(return_value=True)
+            cpos[port] = cpo
+        monkeypatch.setattr(cpoutil, "current_port_config", {
+            "Ethernet{}".format(index * 8): {"index": str(index + 1), "lanes": "1,2"}
+            for index in range(3)
+        })
+        monkeypatch.setattr(cpoutil, "cpo_object_map", {
+            PORT: cpos, OPTICAL_ENGINE: {"oe0": cpos[1]}, EXTERNAL_LASER_SOURCE: {"els0": cpos[1]},
+        })
+
+        @contextmanager
+        def no_snapshot():
+            yield lambda endpoint, api: None
+
+        with mock.patch.object(cpoutil, "_dom_eeprom_snapshot", no_snapshot):
+            with mock.patch("builtins.open", wraps=open) as opened:
+                baseline = invoke(["show", "interface", "dom", "--json"])
+                baseline_reads = opened.call_count
+        with mock.patch("builtins.open", wraps=open) as opened:
+            optimized = invoke(["show", "interface", "dom", "--json"])
+            optimized_reads = opened.call_count
+        assert baseline.exit_code == optimized.exit_code == 0
+        assert json.loads(baseline.output) == json.loads(optimized.output)
+        assert baseline_reads == 18
+        assert optimized_reads == 2
+        for endpoint in endpoints:
+            assert endpoint.api.xcvr_eeprom.reader == endpoint.read_eeprom
+
+    def test_different_banks_and_paths_do_not_share_values(self, tmp_path):
+        from sonic_platform_base.sonic_xcvr.mem_maps.public.cmis.pages.page import CmisPage
+        first, second = tmp_path / "first", tmp_path / "second"
+        data = bytearray(0x30000)
+        bank0 = CmisPage.linear_offset(0x10, 0, 128)
+        bank1 = CmisPage.linear_offset(0x10, 1, 128)
+        assert bank0 != bank1
+        data[bank0] = 17
+        data[bank1] = 34
+        first.write_bytes(data)
+        data[bank0] = 51
+        second.write_bytes(data)
+        oe = self.endpoint(first)
+        peer = self.endpoint(first)
+        other = self.endpoint(second)
+        with cpoutil._dom_eeprom_snapshot() as attach:
+            for endpoint in (oe, peer, other):
+                attach(endpoint, endpoint.api)
+            assert oe.api.xcvr_eeprom.reader(bank0, 1) == bytearray([17])
+            assert peer.api.xcvr_eeprom.reader(bank1, 1) == bytearray([34])
+            assert other.api.xcvr_eeprom.reader(bank0, 1) == bytearray([51])
+
+    def test_returned_buffers_are_not_shared(self, tmp_path):
+        path = tmp_path / "eeprom"
+        path.write_bytes(b"ABCD")
+        endpoint = self.endpoint(path)
+        read = endpoint.api.xcvr_eeprom
+        with cpoutil._dom_eeprom_snapshot() as attach:
+            attach(endpoint, endpoint.api)
+            first = read.reader(0, 4)
+            first[0] = 0
+            second = read.reader(0, 4)
+            second[1] = 0
+            assert read.reader(0, 4) == bytearray(b"ABCD")
+
+    def test_failed_or_short_reads_are_not_cached(self, tmp_path):
+        path = tmp_path / "eeprom"
+        endpoint = self.endpoint(path)
+        read = endpoint.api.xcvr_eeprom
+        with cpoutil._dom_eeprom_snapshot() as attach:
+            attach(endpoint, endpoint.api)
+            assert read.reader(0, 4) is None
+            path.write_bytes(b"AB")
+            assert read.reader(0, 4) == bytearray(b"AB")
+            path.write_bytes(b"WXYZ")
+            assert read.reader(0, 4) == bytearray(b"WXYZ")
+
+    def test_snapshot_expires_and_reader_restores_after_error(self, tmp_path):
+        path = tmp_path / "eeprom"
+        path.write_bytes(b"AB")
+        endpoint = self.endpoint(path)
+        read = endpoint.api.xcvr_eeprom
+        original = read.reader
+        with pytest.raises(RuntimeError, match="stop"):
+            with cpoutil._dom_eeprom_snapshot() as attach:
+                attach(endpoint, endpoint.api)
+                attach(endpoint, endpoint.api)
+                assert read.reader(0, 2) == bytearray(b"AB")
+                raise RuntimeError("stop")
+        assert read.reader is original
+        path.write_bytes(b"CD")
+        with cpoutil._dom_eeprom_snapshot() as attach:
+            attach(endpoint, endpoint.api)
+            assert read.reader(0, 2) == bytearray(b"CD")
+        assert read.reader is original
+
+    def test_custom_reader_is_not_wrapped(self, tmp_path):
+        endpoint = self.endpoint(tmp_path / "unused")
+        read = endpoint.api.xcvr_eeprom
+        reader = mock.Mock(return_value=bytearray(b"AB"))
+        read.reader = reader
+        with cpoutil._dom_eeprom_snapshot() as attach:
+            attach(endpoint, endpoint.api)
+            assert read.reader is reader
+            assert read.reader(0, 2) == bytearray(b"AB")
+            assert read.reader(0, 2) == bytearray(b"AB")
+        assert reader.call_count == 2

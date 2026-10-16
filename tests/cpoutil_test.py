@@ -43,40 +43,109 @@ def shared_port_mapping(monkeypatch):
 
 
 CPO_DATA = {
-    "oes": {
-        "oe0": {"index": 0, "oe_cmis_path": "/sys/oe0/"},
-        "oe1": {"index": 1, "oe_cmis_path": "/sys/oe1/"},
-    },
-    "elss": {
-        "els0": {"index": 0},
-        "els1": {"index": 1},
+    "devices": {
+        "oe0": {
+            "device_type": "optical_engine",
+            "max_banks": 2,
+            "asic_lanes": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8
+            ]
+        },
+        "oe1": {
+            "device_type": "optical_engine",
+            "max_banks": 1,
+            "asic_lanes": [
+                9,
+                10,
+                11,
+                12
+            ]
+        },
+        "els0": {
+            "device_type": "external_laser_source",
+            "laser_to_asic_lane_mapping": {}
+        },
+        "els1": {
+            "device_type": "external_laser_source",
+            "laser_to_asic_lane_mapping": {}
+        }
     },
     "interfaces": {
         "Ethernet8": {
             "index": "2,2,2,2",
             "lanes": "5,6,7,8",
-            "oe_id": 0,
-            "oe_bank_id": 1,
-            "els_id": 0,
-            "laser_ids": [4, 5, 6, 7],
+            "associated_devices": [
+                {
+                    "device_id": "oe0",
+                    "bank": 1
+                },
+                {
+                    "device_id": "els0"
+                }
+            ]
         },
         "Ethernet0": {
             "index": "1,1,1,1",
             "lanes": "1,2,3,4",
-            "oe_id": 0,
-            "oe_bank_id": 0,
-            "els_id": 0,
-            "laser_ids": [0, 1, 2, 3],
+            "associated_devices": [
+                {
+                    "device_id": "oe0",
+                    "bank": 0
+                },
+                {
+                    "device_id": "els0"
+                }
+            ]
         },
         "Ethernet16": {
             "index": "3,3,3,3",
             "lanes": "9,10,11,12",
-            "oe_id": 1,
-            "oe_bank_id": 0,
-            "els_id": 1,
-            "laser_ids": [0, 1, 2, 3],
-        },
+            "associated_devices": [
+                {
+                    "device_id": "oe1",
+                    "bank": 0
+                },
+                {
+                    "device_id": "els1"
+                }
+            ]
+        }
     },
+    "platform_data": {
+        "interfaces": {
+            "Ethernet8": {
+                "laser_ids": [
+                    4,
+                    5,
+                    6,
+                    7
+                ]
+            },
+            "Ethernet0": {
+                "laser_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                ]
+            },
+            "Ethernet16": {
+                "laser_ids": [
+                    0,
+                    1,
+                    2,
+                    3
+                ]
+            }
+        }
+    }
 }
 
 
@@ -119,11 +188,9 @@ class TestCpoMapping(object):
         ]
 
     def test_rejects_unknown_oe(self):
-        invalid = dict(CPO_DATA)
-        invalid["interfaces"] = {
-            "Ethernet0": dict(CPO_DATA["interfaces"]["Ethernet0"], oe_id=99)
-        }
-        with pytest.raises(CpoMappingError, match="unknown OE"):
+        invalid = copy.deepcopy(CPO_DATA)
+        invalid["interfaces"]["Ethernet0"]["associated_devices"][0]["device_id"] = "oe99"
+        with pytest.raises(CpoMappingError, match="unknown device"):
             CpoMapping(invalid)
 
 
@@ -219,32 +286,33 @@ class TestOeLocalBank(object):
     def sparse_bank(self, coverage_environment, monkeypatch):
         def use_topology_bank(bank):
             data = copy.deepcopy(COVERAGE_CPO_DATA)
-            data["interfaces"]["Ethernet0"]["oe_bank_id"] = bank
+            data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = bank
+            data["devices"]["oe0"]["max_banks"] = 8
             cpoutil.cpo_mapping = CpoMapping(data, COVERAGE_PORT_CONFIG)
         monkeypatch.setattr(coverage_environment.api, "get_max_supported_banks", lambda: 8)
         return use_topology_bank
 
-    @pytest.mark.parametrize("topology_bank", [4, 12])
-    def test_sparse_or_global_bank_is_not_renumbered(self, coverage_environment, sparse_bank, topology_bank):
-        # Only bank 4 of the OE is mapped; 12 is the same bank numbered across OEs.
+    @pytest.mark.parametrize("topology_bank", [0, 4, 7])
+    def test_local_bank_is_not_renumbered(self, coverage_environment, sparse_bank, topology_bank):
+        # A sparse topology retains its declared OE-local bank.
         sparse_bank(topology_bank)
         mapping = cpoutil.cpo_mapping.get_interface("Ethernet0")
-        assert cpoutil._local_oe_bank(mapping) == 4
-        assert cpoutil._resource_banks(OPTICAL_ENGINE, "oe0") == [4]
+        assert cpoutil._local_oe_bank(mapping) == topology_bank
+        assert cpoutil._resource_banks(OPTICAL_ENGINE, "oe0") == [topology_bank]
 
         result = invoke_coverage(
             ["write-eeprom", "interface", "Ethernet0", "--oe", "-n", "0x10", "-o", "0x82", "-d", "ff"])
         assert result.exit_code == 0, result.output
-        assert [offset for offset, _, _ in coverage_environment.writes] == [4 * 0x10000 + 0x10 * 0x100 + 0x82]
+        assert [offset for offset, _, _ in coverage_environment.writes] == [
+            topology_bank * 0x10000 + 0x10 * 0x100 + 0x82]
 
         coverage_environment.reads.clear()
         result = invoke_coverage(["read-eeprom", "interface", "Ethernet0", "--oe"])
         assert result.exit_code == 0, result.output
-        assert "Upper page 10h bank 4h" in result.output
-        assert "Upper page 10h bank 0h" not in result.output
+        assert "Upper page 10h bank {:x}h".format(topology_bank) in result.output
 
     def test_map_reports_local_bank(self, coverage_environment, sparse_bank):
-        sparse_bank(12)
+        sparse_bank(4)
         result = invoke_coverage(["show", "interface", "map", "Ethernet0", "--json"])
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["Ethernet0"]["oe"]["bank"] == 4
@@ -259,19 +327,46 @@ class TestOeLocalBank(object):
 # Additional cpoutil command and topology coverage.
 
 COVERAGE_CPO_DATA = {
-    "oes": {"oe0": {"index": 0}},
-    "elss": {"els0": {"index": 0}},
+    "devices": {
+        "oe0": {
+            "device_type": "optical_engine",
+            "max_banks": 1,
+            "asic_lanes": [
+                1,
+                2
+            ]
+        },
+        "els0": {
+            "device_type": "external_laser_source",
+            "laser_to_asic_lane_mapping": {}
+        }
+    },
     "interfaces": {
         "Ethernet0": {
             "index": "1",
             "lanes": "1,2",
-            "oe_id": 0,
-            "oe_bank_id": 0,
-            "els_id": 0,
-            "els_bank_id": 0,
-            "laser_ids": [0, 1],
-        },
+            "associated_devices": [
+                {
+                    "device_id": "oe0",
+                    "bank": 0
+                },
+                {
+                    "device_id": "els0",
+                    "bank": 0
+                }
+            ]
+        }
     },
+    "platform_data": {
+        "interfaces": {
+            "Ethernet0": {
+                "laser_ids": [
+                    0,
+                    1
+                ]
+            }
+        }
+    }
 }
 
 
@@ -506,9 +601,9 @@ def command_paths(command, path=()):
         yield from command_paths(child, path + (name,))
 
 
-HARDWARE_COMMANDS = [
+HARDWARE_COMMANDS = [["show", "interface", "speed", "application"]] + [
     ["show", "interface", name] for name in
-    ("map", "presence", "dom", "tx-disable", "speed", "lane-status")
+    ("map", "presence", "dom", "tx-disable", "lane-status")
 ] + [
     ["show", "oe", name] for name in
     ("lpmode", "status", "temperature")
@@ -648,11 +743,9 @@ class TestCommunityMappingCoverage(object):
         "data,match",
         [
             (None, "root must be an object"),
-            ({"oes": {}, "elss": {}, "interfaces": {}}, "non-empty oes"),
-            ({"oes": {"oe0": {}}, "elss": {}, "interfaces": {}},
-             "non-empty elss"),
-            ({"oes": {"oe0": {}}, "elss": {"els0": {}},
-              "interfaces": {}}, "non-empty interfaces"),
+            ({"oes": {}, "elss": {}, "interfaces": {}}, "non-empty devices"),
+            ({"devices": {}, "interfaces": {}}, "non-empty devices"),
+            ({"devices": {"oe0": {}}, "interfaces": {}}, "non-empty interfaces"),
         ],
     )
     def test_rejects_missing_topology_sections(self, data, match):
@@ -686,12 +779,12 @@ class TestCommunityMappingCoverage(object):
 
     def test_mapping_validation_errors(self):
         bad = json.loads(json.dumps(COVERAGE_CPO_DATA))
-        bad["oes"]["bad"] = bad["oes"].pop("oe0")
-        with pytest.raises(CpoMappingError, match="inconsistent index"):
+        bad["devices"]["bad"] = bad["devices"].pop("oe0")
+        with pytest.raises(CpoMappingError, match="invalid oe device id"):
             CpoMapping(bad)
 
         bad = json.loads(json.dumps(COVERAGE_CPO_DATA))
-        bad["interfaces"]["Ethernet0"]["els_bank_id"] = "bad"
+        bad["interfaces"]["Ethernet0"]["associated_devices"][1]["bank"] = "bad"
         with pytest.raises(CpoMappingError, match="invalid ELS bank"):
             CpoMapping(bad)
 
@@ -806,7 +899,7 @@ class TestHelperCoverage(object):
                           "els": {"info": None, "dom": None, "thresholds": None}}
         )
         cpoutil.print_records({"oe0": [1, 2]}, False, field_header="Lane")
-        cpoutil.print_speed_records(
+        cpoutil.print_application_records(
             {"Ethernet0": {"Application Select Controls": {"lane00": 400000}}},
             False,
         )
@@ -834,7 +927,7 @@ class TestCommandCoverage(object):
             ["show", "interface", "dom", "Ethernet0"],
             ["show", "interface", "dom", "Ethernet0", "--json"],
             ["show", "interface", "tx-disable", "Ethernet0"],
-            ["show", "interface", "speed", "Ethernet0"],
+            ["show", "interface", "speed", "application", "Ethernet0"],
             ["show", "interface", "lane-status", "Ethernet0"],
             ["show", "oe", "lpmode"],
             ["show", "oe", "status"],
@@ -1119,10 +1212,12 @@ class TestCpoHelpers:
         monkeypatch.setattr(helper, "platform_sfputil", None)
         load = mock.Mock(side_effect=lambda: setattr(helper, "platform_sfputil", shared_port_mapping))
         read_mappings = mock.Mock()
-        read_lanes = mock.Mock(side_effect=lambda db, table, field, port: lane_fields[port])
+        read_ports = mock.Mock(return_value={
+            port: {"lanes": lanes} for port, lanes in lane_fields.items()
+        })
         monkeypatch.setattr(helper, "load_platform_sfputil", load)
         monkeypatch.setattr(helper, "platform_sfputil_read_porttab_mappings", read_mappings)
-        monkeypatch.setattr(helper, "get_value_from_db_by_field", read_lanes)
+        monkeypatch.setattr(cpoutil.multi_asic, "get_port_table", read_ports)
         cpoutil.load_current_port_config()
         load.assert_called_once_with()
         read_mappings.assert_called_once_with()
@@ -1130,10 +1225,7 @@ class TestCpoHelpers:
             "Ethernet0": {"index": [1], "lanes": (41, 43)},
             "Ethernet2": {"index": [1], "lanes": (42, 44)},
         }
-        assert read_lanes.call_args_list == [
-            mock.call("CONFIG_DB", "PORT", "lanes", "Ethernet0"),
-            mock.call("CONFIG_DB", "PORT", "lanes", "Ethernet2"),
-        ]
+        read_ports.assert_called_once_with()
         cpoutil.load_current_port_config()
         load.assert_called_once_with()
 
@@ -1598,7 +1690,10 @@ class TestGangedPorts:
 
     @pytest.mark.parametrize("command", ["tx-disable", "speed", "lane-status"])
     def test_all_port_commands_use_the_logical_port(self, ganged, command):
-        result = invoke_coverage(["show", "interface", command, "--json"])
+        arguments = ["show", "interface", command]
+        if command == "speed":
+            arguments.append("application")
+        result = invoke_coverage(arguments + ["--json"])
         assert result.exit_code == 0, result.output
         assert set(json.loads(result.output)) == {"Ethernet0:1 (ganged)", "Ethernet0:2 (ganged)"}
 
@@ -1832,3 +1927,162 @@ class TestDomJsonAndReadFailures:
         result = invoke_coverage(["show", "interface", "dom", "Ethernet0"])
         assert result.exit_code != 0
         assert "This functionality is not implemented" in result.output
+
+
+class TestPortConfigurationSnapshot:
+    def configure(self, monkeypatch, shared_port_mapping, ports, physical_ports):
+        helper = cpoutil.platform_sfputil_helper
+        shared_port_mapping.logical = ports
+        shared_port_mapping.is_logical_port.side_effect = lambda port: port in ports
+        shared_port_mapping.get_logical_to_physical.side_effect = lambda port: physical_ports[port]
+        monkeypatch.setattr(helper, "platform_sfputil_read_porttab_mappings", mock.Mock())
+        monkeypatch.setattr(helper, "get_value_from_db_by_field", mock.Mock(
+            side_effect=AssertionError("per-port database query")
+        ))
+        monkeypatch.setattr(cpoutil.multi_asic, "get_namespace_for_port", mock.Mock(
+            side_effect=AssertionError("per-port namespace discovery")
+        ))
+        monkeypatch.setattr(cpoutil, "current_port_config", {})
+
+    @pytest.mark.parametrize("namespaces", [[""], ["asic0", "asic1"]])
+    @pytest.mark.parametrize("port_count", [1, 130])
+    def test_table_reads_scale_with_namespaces_not_ports(
+            self, monkeypatch, shared_port_mapping, namespaces, port_count):
+        ports = ["Ethernet{}".format(index * 8) for index in range(port_count)]
+        physical = {port: [index + 1] for index, port in enumerate(ports)}
+        self.configure(monkeypatch, shared_port_mapping, ports, physical)
+        tables = {namespace: {} for namespace in namespaces}
+        expected = {}
+        for index, port in enumerate(ports):
+            lanes = (index * 8 + 1, index * 8 + 2)
+            namespace = namespaces[index % len(namespaces)]
+            # get_table can return typed lanes rather than a comma-separated string.
+            value = list(lanes) if index % 2 else ",".join(map(str, lanes))
+            tables[namespace][port] = {"lanes": value, "speed": "800000"}
+            expected[port] = {"index": physical[port], "lanes": lanes}
+        tables[namespaces[0]]["NotInLogicalList"] = {"lanes": "999"}
+        databases = {namespace: mock.Mock() for namespace in namespaces}
+        for namespace, database in databases.items():
+            database.get_table.return_value = tables[namespace]
+        namespace_list = mock.Mock(return_value=namespaces)
+        connector = mock.Mock(side_effect=lambda namespace: databases[namespace])
+        monkeypatch.setattr(cpoutil.multi_asic, "get_namespace_list", namespace_list)
+        monkeypatch.setattr(cpoutil.multi_asic.swsscommon, "ConfigDBConnector", connector)
+
+        cpoutil.load_current_port_config()
+
+        assert cpoutil.current_port_config == expected
+        namespace_list.assert_called_once_with(None)
+        assert connector.call_args_list == [mock.call(namespace=ns) for ns in namespaces]
+        for database in databases.values():
+            database.connect.assert_called_once_with()
+            database.get_table.assert_called_once_with("PORT")
+            database.get.assert_not_called()
+
+    def test_breakout_ports_keep_distinct_lanes_and_shared_physical_index(
+            self, monkeypatch, shared_port_mapping):
+        ports = ["Ethernet0", "Ethernet2"]
+        self.configure(monkeypatch, shared_port_mapping, ports, {port: [1] for port in ports})
+        read = mock.Mock(return_value={
+            "Ethernet0": {"lanes": "41,43"}, "Ethernet2": {"lanes": [42, 44]},
+        })
+        monkeypatch.setattr(cpoutil.multi_asic, "get_port_table", read)
+        cpoutil.load_current_port_config()
+        assert cpoutil.current_port_config == {
+            "Ethernet0": {"index": [1], "lanes": (41, 43)},
+            "Ethernet2": {"index": [1], "lanes": (42, 44)},
+        }
+        read.assert_called_once_with()
+
+    @pytest.mark.parametrize("table", [{}, {"Ethernet0": {}}, {"Ethernet0": {"lanes": None}}])
+    def test_missing_port_or_lanes_is_reported(self, monkeypatch, shared_port_mapping, table):
+        self.configure(monkeypatch, shared_port_mapping, ["Ethernet0"], {"Ethernet0": [1]})
+        monkeypatch.setattr(cpoutil.multi_asic, "get_port_table", mock.Mock(return_value=table))
+        with pytest.raises(cpoutil.CpoCommandError, match="Ethernet0.*no usable lanes"):
+            cpoutil.load_current_port_config()
+
+    def test_second_load_reads_fresh_lanes(self, monkeypatch, shared_port_mapping):
+        self.configure(monkeypatch, shared_port_mapping, ["Ethernet0"], {"Ethernet0": [1]})
+        read = mock.Mock(side_effect=[
+            {"Ethernet0": {"lanes": "1,2"}}, {"Ethernet0": {"lanes": "3,4"}},
+        ])
+        monkeypatch.setattr(cpoutil.multi_asic, "get_port_table", read)
+        cpoutil.load_current_port_config()
+        assert cpoutil.current_port_config["Ethernet0"]["lanes"] == (1, 2)
+        cpoutil.load_current_port_config()
+        assert cpoutil.current_port_config["Ethernet0"]["lanes"] == (3, 4)
+        assert read.call_count == 2
+
+
+class TestCpoutilEntryPoint:
+    def test_console_entry_point_generates_bash_completion(self, monkeypatch, tmp_path):
+        import ast
+        from importlib.metadata import EntryPoint
+        from pathlib import Path
+        import runpy
+
+        repo = Path(cpoutil.__file__).resolve().parents[1]
+        setup_tree = ast.parse((repo / "setup.py").read_text())
+        entries = next(
+            ast.literal_eval(value)
+            for node in ast.walk(setup_tree) if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and key.value == "console_scripts"
+        )
+        value = next(entry.split("=", 1)[1].strip() for entry in entries
+                     if entry.split("=", 1)[0].strip() == "cpoutil")
+        entry = EntryPoint(name="cpoutil", value=value, group="console_scripts")
+        generator = runpy.run_path(str(repo / "sonic-utilities-data/generate_completions.py"))
+        distribution = types.SimpleNamespace(entry_points=[entry])
+        monkeypatch.setattr("importlib.metadata.distribution", lambda name: distribution)
+        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
+        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
+        generator["generate_completions"](str(tmp_path))
+
+        completion = tmp_path / "cpoutil"
+        assert completion.is_file(), "Registered entry point was skipped by the completion generator"
+        assert "_CPOUTIL_COMPLETE" in completion.read_text()
+        assert entry.load() is cpoutil.cli
+        initialize.assert_not_called()
+
+    @pytest.mark.parametrize("words,cword,expected", [
+        ("cpoutil sh", "1", "plain,show"),
+        ("cpoutil show inter", "2", "plain,interface"),
+    ])
+    def test_bash_completion_does_not_load_platform(self, monkeypatch, words, cword, expected):
+        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
+        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
+        result = CliRunner().invoke(cpoutil.cli, [], prog_name="cpoutil", env={
+            "_CPOUTIL_COMPLETE": "bash_complete", "COMP_WORDS": words, "COMP_CWORD": cword,
+        })
+        assert result.exit_code == 0, result.output
+        assert expected in result.output
+        initialize.assert_not_called()
+
+
+class TestHldOnlyTopology:
+    def test_legacy_reference_is_ignored(self):
+        data = copy.deepcopy(CPO_DATA)
+        data["legacy_bailly_reference"] = {"devices": {"oe99": {}}, "interfaces": {"bad": {}}}
+        mapping = CpoMapping(data)
+        assert mapping.ports() == ["Ethernet0", "Ethernet8", "Ethernet16"]
+        assert mapping.resource_ids(OPTICAL_ENGINE) == ["oe0", "oe1"]
+
+    def test_legacy_reference_cannot_replace_hld_devices(self):
+        data = {"legacy_bailly_reference": CPO_DATA, "interfaces": CPO_DATA["interfaces"]}
+        with pytest.raises(CpoMappingError, match="non-empty devices"):
+            CpoMapping(data)
+
+    @pytest.mark.parametrize("bank", [-1, 2, 12])
+    def test_oe_bank_must_be_local_and_in_range(self, bank):
+        data = copy.deepcopy(CPO_DATA)
+        data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = bank
+        with pytest.raises(CpoMappingError, match="invalid OE bank"):
+            CpoMapping(data)
+
+    @pytest.mark.parametrize("lasers", [[-1], [0, 0]])
+    def test_platform_laser_groups_are_validated(self, lasers):
+        data = copy.deepcopy(COVERAGE_CPO_DATA)
+        data["platform_data"]["interfaces"]["Ethernet0"]["laser_ids"] = lasers
+        with pytest.raises(CpoMappingError, match="unique non-negative"):
+            CpoMapping(data)
