@@ -608,10 +608,7 @@ class TestDirectPlatformApiCommands(object):
             "low_power_mode": False,
             "interrupt_event": True,
         }
-        assert values["ELS Lane State"] == {
-            "lane00": "Active",
-            "lane01": "Inactive",
-        }
+        assert set(values) == {"Data Path State Indicator", "ELS", "ELS Status"}
 
     def test_interrupt_event_normalizes_public_status(self):
         with mock.patch.object(

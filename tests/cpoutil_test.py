@@ -275,7 +275,6 @@ class TestMappingCommand(object):
         assert payload["Ethernet8"]["oe"]["lanes"] == [5, 6, 7, 8]
         assert payload["Ethernet8"]["els"] == {
             "id": "ELS0",
-            "lasers": [4, 5, 6, 7],
         }
 
 
@@ -735,10 +734,8 @@ class TestCommunityMappingCoverage(object):
         second = mapping.get_interface("Ethernet4")
         assert first.physical_ports == (1,)
         assert first.lanes == (1, 2)
-        assert first.laser_ids == (0,)
         assert first.els_bank == 2
         assert second.lanes == (3, 4)
-        assert second.laser_ids == (1,)
         assert mapping.resource_ids(OPTICAL_ENGINE) == ["oe0"]
         assert mapping.get_interfaces("Ethernet0") == [first]
 
@@ -814,7 +811,6 @@ class TestHelperCoverage(object):
         assert cpoutil.get_port_lanes("Ethernet0") == (1, 2)
         assert cpoutil.get_cpo_lane_positions("Ethernet0") == (0, 1)
         assert cpoutil.get_cpo_lane_mask("Ethernet0") == 3
-        assert cpoutil.get_cpo_laser_ids("Ethernet0") == ((0, 1), ())
         assert cpoutil.get_physical_port_name("Ethernet0", 2, True).endswith(
             "(ganged)"
         )
@@ -857,9 +853,6 @@ class TestHelperCoverage(object):
         assert cpoutil._select_lane_values({"DP2": 2, "DP1": 1}, (1,)) == {
             "lane01": 2
         }
-        assert cpoutil._select_els_laser_values(
-            {"Laser0": "a", "Laser1": "b"}, (1,)
-        ) == {"lane01": "b"}
 
     def test_formatters(self, capsys):
         advertisements = {
@@ -912,9 +905,6 @@ class TestHelperCoverage(object):
                     "Data Path State Indicator": {"lane00": "Active"},
                     "ELS": "ELS0",
                     "ELS Status": {"module_state": "Ready"},
-                    "ELS Lane State": {"lane00": "Active"},
-                    "ELS Lasers": [0],
-                    "Shared ELS Lasers": [],
                 }
             },
             False,
@@ -1355,7 +1345,7 @@ class TestOptionalElsApis:
     def test_unsupported_els_reads_do_not_change_oe(
             self, coverage_environment, monkeypatch, arguments):
         els_api = CoverageFakeApi()
-        for method in ("get_module_state", "get_per_lane_state"):
+        for method in ("get_module_state", "get_elsfp_status"):
             monkeypatch.setattr(els_api, method, mock.Mock(
                 side_effect=NotImplementedError("ELS operation is not implemented")))
         oe_api = CoverageFakeApi()
@@ -1390,83 +1380,6 @@ class TestOptionalElsApis:
         assert cpoutil._eeprom_linear_offset(
             EXTERNAL_LASER_SOURCE, "els0", cpo, 0, 0xB2, 0x80
         ) == 0xB2 * 128 + 0x80
-
-
-class TestExplicitLaserMapping:
-    @staticmethod
-    def configure(monkeypatch, data, ports):
-        mapping = CpoMapping(data, ports)
-        monkeypatch.setattr(cpoutil, "cpo_mapping", mapping)
-        monkeypatch.setattr(cpoutil, "current_port_config", ports)
-        return mapping
-
-    @staticmethod
-    def nonuniform_topology():
-        data = json.loads(json.dumps(COMMUNITY_DATA))
-        data["devices"]["oe0"].update(asic_lanes=[1, 2, 3, 4, 5, 6], max_banks=1)
-        # The first laser owns noncontiguous lanes; the groups have unequal sizes.
-        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = {
-            "1": [1, 3, 5], "2": [2], "3": [4, 6],
-        }
-        del data["interfaces"]["Ethernet4"]
-        return data
-
-    def test_noncontiguous_unequal_groups_select_exact_lasers(self, monkeypatch):
-        self.configure(monkeypatch, self.nonuniform_topology(), {
-            "Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"},
-            "Ethernet1": {"index": "1", "lanes": "1,3,5"},
-            "Ethernet2": {"index": "1", "lanes": "2,4,6"},
-        })
-        assert cpoutil.get_cpo_laser_ids("Ethernet1") == ((0,), ())
-        assert cpoutil.get_cpo_laser_ids("Ethernet2") == ((1, 2), ())
-
-    def test_shared_laser_across_banks_is_reported(self, monkeypatch, coverage_environment):
-        data = json.loads(json.dumps(COMMUNITY_DATA))
-        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = {
-            "1": [1, 3], "2": [2], "3": [4],
-        }
-        self.configure(monkeypatch, data, COVERAGE_PORT_CONFIG)
-        assert cpoutil.get_cpo_laser_ids("Ethernet0") == ((0, 1), (0,))
-
-    def test_shared_laser_within_bank_is_reported(self, monkeypatch, coverage_environment):
-        self.configure(monkeypatch, self.nonuniform_topology(), {
-            "Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"},
-            "Ethernet1": {"index": "1", "lanes": "1,3"},
-        })
-        assert cpoutil.get_cpo_laser_ids("Ethernet1") == ((0,), (0,))
-
-    def test_breakout_without_lane_mapping_cannot_resolve_lasers(self, monkeypatch, coverage_environment):
-        self.configure(monkeypatch, COVERAGE_CPO_DATA, {
-            "Ethernet0": {"index": "1", "lanes": "1,2"},
-            "Ethernet1": {"index": "1", "lanes": "2"},
-        })
-        assert cpoutil.get_cpo_laser_ids("Ethernet0") == ((0, 1), ())
-        with pytest.raises(cpoutil.CpoLaserResolutionError, match="laser_to_asic_lane_mapping"):
-            cpoutil.get_cpo_laser_ids("Ethernet1")
-
-    def test_incomplete_explicit_lane_mapping_is_rejected(self):
-        data = self.nonuniform_topology()
-        del data["devices"]["els0"]["laser_to_asic_lane_mapping"]["3"]
-        with pytest.raises(CpoMappingError, match="ASIC lanes without an ELS laser mapping"):
-            CpoMapping(data, {"Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"}})
-
-    @pytest.mark.parametrize("laser_map", [{"0": [1, 2]}, {"bad": [1, 2]}, {"1": []}, []])
-    def test_invalid_explicit_mapping_is_rejected(self, laser_map):
-        data = self.nonuniform_topology()
-        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = laser_map
-        with pytest.raises(CpoMappingError):
-            CpoMapping(data, {"Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"}})
-
-    def test_normalized_integer_laser_ids_and_string_lanes(self, monkeypatch):
-        data = self.nonuniform_topology()
-        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = {
-            1: "1,3,5", 2: "2", 3: "4,6",
-        }
-        self.configure(monkeypatch, data, {
-            "Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"},
-            "Ethernet1": {"index": "1", "lanes": "1,3,5"},
-        })
-        assert cpoutil.get_cpo_laser_ids("Ethernet1") == ((0,), ())
 
 
 @pytest.fixture
@@ -1739,78 +1652,7 @@ class TestInterfaceElsEepromBank:
         assert [offset for offset, _, _ in community.writes] == [0x1a * 0x100 + 0x80]
 
 
-class TestLaneStatusLaserAssociation:
-    """Each displayed OE lane must show the laser the topology associates with it."""
-
-    # Laser states chosen so that any wrong pairing changes the displayed state.
-    LASER_STATES = {"LaneState1": "Active", "LaneState2": "Inactive", "LaneState3": "Disabled"}
-
-    @pytest.fixture
-    def nonuniform(self, coverage_environment, monkeypatch):
-        # laser 0 -> ASIC lanes 1, 3, 5; laser 1 -> lane 2; laser 2 -> lanes 4, 6
-        TestExplicitLaserMapping.configure(
-            monkeypatch, TestExplicitLaserMapping.nonuniform_topology(),
-            {"Ethernet0": {"index": "1", "lanes": "1,2,3,4,5,6"}})
-        api = coverage_environment.api
-        monkeypatch.setattr(api, "get_datapath_state", lambda: ["DataPathActivated"] * 6, raising=False)
-        monkeypatch.setattr(api, "get_per_lane_state", lambda: dict(self.LASER_STATES), raising=False)
-        return coverage_environment
-
-    EXPECTED = [  # (lane position, laser, state)
-        (0, 0, "Active"), (1, 1, "Inactive"), (2, 0, "Active"),
-        (3, 2, "Disabled"), (4, 0, "Active"), (5, 2, "Disabled"),
-    ]
-
-    def test_json_carries_the_topology_association(self, nonuniform):
-        result = invoke_coverage(["show", "interface", "lane-status", "Ethernet0", "--json"])
-        assert result.exit_code == 0, result.output
-        record = json.loads(result.output)["Ethernet0"]
-        assert record["Lane Lasers"] == {
-            "lane{:02d}".format(position): laser for position, laser, _ in self.EXPECTED
-        }
-
-    def test_table_shows_the_correct_laser_and_state_in_every_row(self, nonuniform):
-        result = invoke_coverage(["show", "interface", "lane-status", "Ethernet0"])
-        assert result.exit_code == 0, result.output
-        rows = [line.split() for line in result.output.splitlines() if line.startswith("Ethernet0")]
-        lane_rows = [row for row in rows if "DataPathActivated" in row]
-        assert len(lane_rows) == len(self.EXPECTED)
-        for row, (_, laser, state) in zip(lane_rows, self.EXPECTED):
-            # Columns end with: ELS, Laser, ELS Lane State, Shared
-            assert row[-4:] == ["ELS0", str(laser), state, "No"], row
-        assert "per-lane association unavailable" not in result.output
-
-    def test_asic_lane_ids_differ_from_lane_positions(self, monkeypatch, coverage_environment):
-        data = TestExplicitLaserMapping.nonuniform_topology()
-        data["devices"]["oe0"]["asic_lanes"] = [33, 34, 35, 36]
-        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = {"1": [33, 35], "2": [34, 36]}
-        TestExplicitLaserMapping.configure(
-            monkeypatch, data, {"Ethernet0": {"index": "1", "lanes": "33,34,35,36"}})
-        context = cpoutil.get_interface_context("Ethernet0")
-        assert cpoutil._lane_lasers(context) == {"lane00": 0, "lane01": 1, "lane02": 0, "lane03": 1}
-
-    def test_no_explicit_mapping_is_not_guessed(self, coverage_environment, monkeypatch):
-        # The legacy topology lists the interface's lasers [0, 1] without a lane mapping.
-        api = coverage_environment.api
-        monkeypatch.setattr(api, "get_datapath_state", lambda: ["DataPathActivated"] * 2, raising=False)
-        monkeypatch.setattr(api, "get_per_lane_state",
-                            lambda: {"LaneState1": "Active", "LaneState2": "Inactive"}, raising=False)
-        result = invoke_coverage(["show", "interface", "lane-status", "Ethernet0", "--json"])
-        assert result.exit_code == 0, result.output
-        assert json.loads(result.output)["Ethernet0"]["Lane Lasers"] == {"lane00": None, "lane01": None}
-
-        table = invoke_coverage(["show", "interface", "lane-status", "Ethernet0"])
-        assert table.exit_code == 0, table.output
-        lane_rows = [line.split() for line in table.output.splitlines()
-                     if line.startswith("Ethernet0") and "DataPathActivated" in line]
-        assert lane_rows and all(row[-3:] == ["N/A", "N/A", "N/A"] for row in lane_rows)
-        assert "per-lane association unavailable" in table.output
-        assert "0: Active, 1: Inactive" in table.output
-
-
-class TestBreakoutWithoutLaneMapping:
-    """Display commands show unresolved lasers instead of aborting; controls still reject."""
-
+class TestInterfaceEndpointMapping:
     PORTS = {
         "Ethernet0": {"index": "1", "lanes": "1"},
         "Ethernet1": {"index": "1", "lanes": "2"},
@@ -1818,51 +1660,45 @@ class TestBreakoutWithoutLaneMapping:
 
     @pytest.fixture
     def breakout(self, coverage_environment, monkeypatch):
-        TestExplicitLaserMapping.configure(monkeypatch, COVERAGE_CPO_DATA, self.PORTS)
-        api = coverage_environment.api
-        monkeypatch.setattr(api, "get_datapath_state", lambda: ["DataPathActivated"] * 2, raising=False)
-        monkeypatch.setattr(api, "get_per_lane_state",
-                            lambda: {"LaneState1": "Active", "LaneState2": "Inactive"}, raising=False)
+        monkeypatch.setattr(cpoutil, "cpo_mapping", CpoMapping(COVERAGE_CPO_DATA, self.PORTS))
+        monkeypatch.setattr(cpoutil, "current_port_config", self.PORTS)
+        monkeypatch.setattr(coverage_environment.api, "get_datapath_state",
+                            lambda: ["DataPathActivated"] * 2, raising=False)
         return coverage_environment
 
-    def test_map_lists_every_port_with_unresolved_lasers(self, breakout):
+    def test_map_preserves_endpoints_and_breakout_lanes_without_lasers(self, breakout):
         result = invoke_coverage(["show", "interface", "map", "--json"])
         assert result.exit_code == 0, result.output
         records = json.loads(result.output)
         assert sorted(records) == ["Ethernet0", "Ethernet1"]
         assert records["Ethernet0"]["oe"]["lanes"] == [1]
         assert records["Ethernet1"]["oe"]["lanes"] == [2]
-        assert all(record["els"]["lasers"] is None for record in records.values())
-
+        assert all(record["els"] == {"id": "ELS0", "bank": 0} for record in records.values())
         table = invoke_coverage(["show", "interface", "map", "Ethernet1"])
         assert table.exit_code == 0, table.output
-        assert cpoutil.UNRESOLVED_LASERS in table.output
+        assert "ELS0" in table.output and "Laser" not in table.output
 
-    def test_lane_status_shows_no_guessed_laser_state(self, breakout):
-        result = invoke_coverage(["show", "interface", "lane-status", "Ethernet1", "--json"])
+    @pytest.mark.parametrize("port", [None, "Ethernet1"])
+    def test_lane_status_does_not_read_or_display_per_laser_state(self, breakout, monkeypatch, port):
+        per_laser = mock.Mock(side_effect=AssertionError("interface command read laser state"))
+        monkeypatch.setattr(breakout.api, "get_per_lane_state", per_laser)
+        command = ["show", "interface", "lane-status"] + ([port] if port else [])
+        result = invoke_coverage(command + ["--json"])
         assert result.exit_code == 0, result.output
-        record = json.loads(result.output)["Ethernet1"]
-        assert record["Data Path State Indicator"] == {"lane01": "DataPathActivated"}
-        assert record["ELS Lasers"] is None
-        assert record["ELS Lane State"] == {}
-        assert record["Lane Lasers"] == {"lane01": None}
-
-        table = invoke_coverage(["show", "interface", "lane-status"])
+        records = json.loads(result.output)
+        assert sorted(records) == ([port] if port else ["Ethernet0", "Ethernet1"])
+        for name, record in records.items():
+            lane = "lane01" if name == "Ethernet1" else "lane00"
+            assert record["Data Path State Indicator"] == {lane: "DataPathActivated"}
+            assert set(record) == {"Data Path State Indicator", "ELS", "ELS Status"}
+            assert record["ELS"] == "ELS0"
+        table = invoke_coverage(command)
         assert table.exit_code == 0, table.output
-        lane_rows = [line.split() for line in table.output.splitlines()
-                     if line.startswith("Ethernet") and "DataPathActivated" in line]
-        assert [row[0] for row in lane_rows] == ["Ethernet0", "Ethernet1"]
-        assert all(row[-3:] == ["N/A", "N/A", "N/A"] for row in lane_rows)
-        assert table.output.count(cpoutil.UNRESOLVED_LASERS) == 2
+        assert "Laser" not in table.output and "Shared" not in table.output
+        assert "ELS status:" in table.output
+        per_laser.assert_not_called()
 
-    def test_full_port_on_same_topology_still_resolves_lasers(self, coverage_environment, monkeypatch):
-        TestExplicitLaserMapping.configure(
-            monkeypatch, COVERAGE_CPO_DATA, {"Ethernet0": {"index": "1", "lanes": "1,2"}})
-        result = invoke_coverage(["show", "interface", "map", "Ethernet0", "--json"])
-        assert result.exit_code == 0, result.output
-        assert json.loads(result.output)["Ethernet0"]["els"]["lasers"] == [0, 1]
-
-    def test_tx_disable_uses_the_cpo_object_without_laser_mapping(self, breakout, monkeypatch):
+    def test_tx_disable_still_uses_the_cpo_object(self, breakout, monkeypatch):
         monkeypatch.setattr(breakout, "tx_disable", mock.Mock(return_value=True), raising=False)
         result = invoke_coverage(["config", "interface", "tx-disable", "Ethernet1", "true"])
         assert result.exit_code == 0, result.output
@@ -2073,27 +1909,23 @@ class TestCpoutilEntryPoint:
 
 
 class TestHldOnlyTopology:
-    @pytest.mark.parametrize("missing", [False, True])
-    def test_precise_laser_map_is_optional(self, missing):
+    @pytest.mark.parametrize("laser_map", [None, {}, {"1": [1]}, {"bad": []}, []])
+    def test_laser_mapping_metadata_is_not_parsed(self, laser_map):
         data = copy.deepcopy(CPO_DATA)
-        for device in data["devices"].values():
-            if device["device_type"] == "external_laser_source":
-                if missing:
-                    device.pop("laser_to_asic_lane_mapping", None)
-                else:
-                    device["laser_to_asic_lane_mapping"] = {}
-        mapping = CpoMapping(data)
-        interface = mapping.get_interface("Ethernet8")
-        assert interface.laser_ids == (4, 5, 6, 7)
-        assert interface.laser_to_asic_lane_mapping == {}
+        data["devices"]["els0"]["laser_to_asic_lane_mapping"] = laser_map
+        interface = CpoMapping(data).get_interface("Ethernet8")
+        assert interface.to_dict() == {
+            "port": "Ethernet8", "physical_ports": [2], "lanes": [5, 6, 7, 8],
+            "oe": {"id": "oe0", "bank": 1}, "els": {"id": "els0", "bank": "N/A"},
+        }
 
-
-    def test_missing_whole_interface_group_is_also_optional(self):
+    @pytest.mark.parametrize("extension", [None, {}, {"interfaces": {"Ethernet0": {"laser_ids": [-1, -1]}}}])
+    def test_platform_laser_groups_are_not_parsed(self, extension):
         data = copy.deepcopy(CPO_DATA)
-        data.pop("platform_data")
+        data["platform_data"] = extension
         mapping = CpoMapping(data)
-        assert mapping.get_interface("Ethernet0").laser_ids == ()
-
+        assert mapping.ports() == ["Ethernet0", "Ethernet8", "Ethernet16"]
+        assert not hasattr(mapping.get_interface("Ethernet0"), "laser_ids")
 
     def test_legacy_reference_is_ignored(self):
         data = copy.deepcopy(CPO_DATA)
@@ -2112,13 +1944,6 @@ class TestHldOnlyTopology:
         data = copy.deepcopy(CPO_DATA)
         data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = bank
         with pytest.raises(CpoMappingError, match="invalid OE bank"):
-            CpoMapping(data)
-
-    @pytest.mark.parametrize("lasers", [[-1], [0, 0]])
-    def test_platform_laser_groups_are_validated(self, lasers):
-        data = copy.deepcopy(COVERAGE_CPO_DATA)
-        data["platform_data"]["interfaces"]["Ethernet0"]["laser_ids"] = lasers
-        with pytest.raises(CpoMappingError, match="unique non-negative"):
             CpoMapping(data)
 
 
