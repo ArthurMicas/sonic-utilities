@@ -1304,23 +1304,6 @@ def show_interface_map(port, json_output):
         click.echo(_format_map_table(records))
 
 
-@show_interface.command("presence")
-@click.argument("port", required=False)
-@output_option
-def show_interface_presence(port, json_output):
-    """Display CPO virtual-module presence for each interface."""
-    records = {}
-    try:
-        for port_name, _, cpo in get_port_cpo_objects(port):
-            records[port_name] = get_cpo_presence(cpo, port_name)
-    except CpoCommandError as exc:
-        raise click.ClickException(str(exc))
-    print_records(
-        records, json_output, ("Interface", "Presence"),
-        boolean_values=("Present", "Not present"),
-    )
-
-
 @show_interface.command("lpmode")
 @click.argument("port", required=False)
 @output_option
@@ -1601,6 +1584,38 @@ def show_oe_temperature(oe_index, json_output):
 @show.group("els")
 def show_els():
     """Display External Laser Source status."""
+
+
+@show_els.command("presence")
+@click.argument("els_index", required=False)
+@output_option
+def show_els_presence(els_index, json_output):
+    """Display physical External Laser Source presence."""
+    records = {}
+    try:
+        for resource_id, cpo in get_resource_cpo_objects(
+                EXTERNAL_LASER_SOURCE, els_index):
+            try:
+                present = cpo.elsfp.get_presence()
+            except (NotImplementedError, AttributeError) as exc:
+                raise CpoCommandError(
+                    "ELS presence is not implemented for '{}'".format(resource_id)
+                ) from exc
+            except Exception as exc:
+                raise CpoCommandError(
+                    "Failed to read ELS presence for '{}': {}".format(resource_id, exc)
+                ) from exc
+            if not isinstance(present, bool):
+                raise CpoCommandError(
+                    "ELS presence API returned invalid data for '{}'".format(resource_id)
+                )
+            records[resource_id] = present
+    except CpoCommandError as exc:
+        raise click.ClickException(str(exc))
+    print_records(
+        records, json_output, ("ELS", "Presence"),
+        boolean_values=("Present", "Not present"),
+    )
 
 
 @show_els.command("lpmode")

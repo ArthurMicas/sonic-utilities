@@ -606,13 +606,13 @@ def command_paths(command, path=()):
 
 HARDWARE_COMMANDS = [["show", "interface", "speed", "application"]] + [
     ["show", "interface", name] for name in
-    ("map", "presence", "dom", "tx-disable", "lane-status")
+    ("map", "dom", "tx-disable", "lane-status")
 ] + [
     ["show", "oe", name] for name in
     ("lpmode", "status", "temperature")
 ] + [
     ["show", "els", name] for name in
-    ("lpmode", "status", "temperature", "output-power")
+    ("presence", "lpmode", "status", "temperature", "output-power")
 ] + [
     ["config", "interface", "tx-disable", "Ethernet0", "true"],
     ["config", "interface", "lpmode", "Ethernet0", "low"],
@@ -935,7 +935,7 @@ class TestCommandCoverage(object):
             ["show", "oe", "lpmode"],
             ["show", "oe", "status"],
             ["show", "oe", "temperature"],
-            ["show", "interface", "presence"],
+            ["show", "els", "presence"],
             ["show", "els", "lpmode"],
             ["show", "els", "status"],
             ["show", "els", "temperature"],

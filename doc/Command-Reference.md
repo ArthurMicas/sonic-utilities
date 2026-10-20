@@ -17162,7 +17162,7 @@ Most `show` commands accept `-j, --json` for machine-readable output. OE and ELS
 
 ## CPO Utilities show commands
 
-**cpoutil show interface map|presence|dom|tx-disable|speed|lane-status|lpmode**
+**cpoutil show interface map|dom|tx-disable|speed|lane-status|lpmode**
 
 These commands display per-interface CPO information. When PORT is omitted, all CPO interfaces are shown. `tx-disable` displays `Tx Disable Status` per lane: `true` means TX is disabled, and `false` means TX is enabled. JSON output keeps these values as booleans.
 
@@ -17173,7 +17173,6 @@ For a breakout subport, `map` and `lane-status` identify its ELS lasers only whe
 - Usage:
   ```
   cpoutil show interface map [PORT] [--json]          # OE, bank, lanes, ELS and lasers of each interface
-  cpoutil show interface presence [PORT] [--json]     # CPO virtual-module presence
   cpoutil show interface dom [PORT] [--json]          # OE and ELS information, monitors and thresholds
   cpoutil show interface tx-disable [PORT] [--json]   # per-lane Tx disable status
   cpoutil show interface speed application [PORT] [--json]  # full configured and active applications per lane
@@ -17183,11 +17182,6 @@ For a breakout subport, `map` and `lane-status` identify its ELS lasers only whe
 
 - Example:
   ```
-  admin@sonic:~$ cpoutil show interface presence Ethernet32
-  Interface    Presence
-  -----------  ----------
-  Ethernet32   Present
-
   admin@sonic:~$ cpoutil show interface lpmode Ethernet448
   Interface    Low-power Mode
   -----------  ----------------
@@ -17211,17 +17205,41 @@ These commands display Optical Engine state.
   OE7   ModuleReady
   ```
 
-**cpoutil show els lpmode|status|temperature|output-power**
+**cpoutil show els presence|lpmode|status|temperature|output-power**
 
 These commands display External Laser Source state.
 
+`presence` reads the platform ELS endpoint's `get_presence()` method once per ELS.
+The presence check does not create an ELS EEPROM API or infer ELS presence from a CPO virtual module.
+When `ELS_INDEX` is omitted, each mapped ELS is listed once, even when it serves multiple interfaces.
+JSON presence results use ELS resource names as keys and boolean values.
+
 - Usage:
   ```
-  cpoutil show els {lpmode|status|temperature|output-power} [ELS_INDEX] [--json]
+  cpoutil show els {presence|lpmode|status|temperature|output-power} [ELS_INDEX] [--json]
   ```
+
+- Parameters:
+  - `ELS_INDEX`: Optional mapped ELS index (`0`) or resource name (`els0`). Omit to show all ELS endpoints.
+
+- Options:
+  - `-j, --json`: Display machine-readable JSON instead of a table.
+
+- Note: `show interface presence [PORT]` has been replaced by `show els presence [ELS_INDEX]`.
+  Presence output is now indexed by ELS, rather than by interface. DOM still checks CPO virtual-module presence internally.
 
 - Example:
   ```
+  admin@sonic:~$ cpoutil show els presence 0
+  ELS    Presence
+  ----   --------
+  ELS0   Present
+
+  admin@sonic:~$ cpoutil show els presence 0 --json
+  {
+      "els0": true
+  }
+
   admin@sonic:~$ cpoutil show els temperature 1
   ELS      Temperature (C)
   -----  -----------------

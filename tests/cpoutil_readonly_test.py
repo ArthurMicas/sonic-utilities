@@ -303,56 +303,72 @@ class TestDirectPlatformApiCommands(object):
         ] == pytest.approx(18.500)
 
     @pytest.mark.parametrize("present", [True, False])
-    def test_interface_presence_calls_cpo_instead_of_endpoints(self, present):
+    def test_els_presence_calls_endpoint_instead_of_cpo(self, present):
         self.cpo.oe = mock.Mock(get_presence=mock.Mock(return_value=not present))
-        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=not present))
-        self.cpo.get_presence = mock.Mock(return_value=present)
-        result = invoke(["show", "interface", "presence", "Ethernet0", "--json"])
+        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=present))
+        self.cpo.get_presence = mock.Mock(return_value=not present)
+        result = invoke(["show", "els", "presence", "0", "--json"])
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"Ethernet0": present}
-        self.cpo.get_presence.assert_called_once_with()
+        assert json.loads(result.output) == {"els0": present}
+        self.cpo.get_presence.assert_not_called()
         self.cpo.oe.get_presence.assert_not_called()
-        self.cpo.elsfp.get_presence.assert_not_called()
+        self.cpo.elsfp.get_presence.assert_called_once_with()
+        self.cpo.elsfp.get_api.assert_not_called()
 
-        table = invoke(["show", "interface", "presence", "Ethernet0"])
+        table = invoke(["show", "els", "presence", "0"])
         assert ("Present" if present else "Not present") in table.output
-        assert "Interface" in table.output
+        assert "ELS" in table.output
 
-    def test_presence_lists_all_interfaces_and_breakouts(self):
-        result = invoke(["show", "interface", "presence", "--json"])
+    def test_presence_lists_els_once_for_shared_interfaces_and_breakouts(self):
+        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=True))
+        result = invoke(["show", "els", "presence", "--json"])
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"Ethernet0": True, "Ethernet1": True}
-        result = invoke(["show", "interface", "presence", "Ethernet1", "--json"])
-        assert json.loads(result.output) == {"Ethernet1": True}
+        assert json.loads(result.output) == {"els0": True}
+        self.cpo.elsfp.get_presence.assert_called_once_with()
+        result = invoke(["show", "els", "presence", "els0", "--json"])
+        assert json.loads(result.output) == {"els0": True}
 
-    @pytest.mark.parametrize("command", ["presence", "dom"])
     @pytest.mark.parametrize("error", [NotImplementedError(), AttributeError(), OSError("read failed")])
-    def test_presence_failures_are_reported_without_endpoint_fallback(self, command, error):
+    def test_dom_presence_failures_are_reported_without_endpoint_fallback(self, error):
         self.cpo.oe = mock.Mock()
         self.cpo.elsfp = mock.Mock()
         self.cpo.get_presence = mock.Mock(side_effect=error)
-        result = invoke(["show", "interface", command, "Ethernet0", "--json"])
+        result = invoke(["show", "interface", "dom", "Ethernet0", "--json"])
         assert result.exit_code != 0
         assert "CPO presence" in result.output and "Ethernet0" in result.output
         assert not self.cpo.oe.mock_calls
         assert not self.cpo.elsfp.mock_calls
 
+    @pytest.mark.parametrize("error", [NotImplementedError(), AttributeError(), OSError("read failed")])
+    def test_els_presence_failures_do_not_fall_back_to_cpo(self, error):
+        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(side_effect=error))
+        self.cpo.get_presence = mock.Mock(return_value=True)
+        result = invoke(["show", "els", "presence", "0", "--json"])
+        assert result.exit_code != 0
+        assert "ELS presence" in result.output and "els0" in result.output
+        self.cpo.get_presence.assert_not_called()
+        self.cpo.elsfp.get_api.assert_not_called()
+
     @pytest.mark.parametrize("value", [None, 1, "False"])
     def test_invalid_presence_result_is_not_reported_as_present(self, value):
-        self.cpo.get_presence = mock.Mock(return_value=value)
-        result = invoke(["show", "interface", "presence", "Ethernet0"])
+        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=value))
+        result = invoke(["show", "els", "presence", "0"])
         assert result.exit_code != 0
-        assert "CPO presence API returned invalid data" in result.output
+        assert "ELS presence API returned invalid data" in result.output
 
-    @pytest.mark.parametrize("command", ["presence", "dom"])
-    def test_inherited_presence_placeholder_is_reported_without_endpoint_reads(self, command):
+    def test_inherited_presence_placeholder_is_reported_without_endpoint_reads(self):
         cpo = cpoutil.CpoBase(None, mock.Mock(), mock.Mock())
         cpoutil.cpo_object_map[PORT][1] = cpo
-        result = invoke(["show", "interface", command, "Ethernet0"])
+        result = invoke(["show", "interface", "dom", "Ethernet0"])
         assert result.exit_code != 0
         assert "CPO presence is not implemented for 'Ethernet0'" in result.output
         assert not cpo.oe.mock_calls
         assert not cpo.elsfp.mock_calls
+
+    def test_interface_presence_has_been_replaced(self):
+        result = invoke(["show", "interface", "presence", "Ethernet0"])
+        assert result.exit_code == 2
+        assert "No such command 'presence'" in result.output
 
     def test_els_lpmode_has_boolean_json_and_readable_table(self):
         result = invoke(["show", "els", "lpmode", "0", "--json"])
