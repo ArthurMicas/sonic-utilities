@@ -1,6 +1,6 @@
-"""Interpret CPO interface, OE and ELS endpoint associations."""
+"""Interpret the community CPO topology and platform extension data."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
 
 from utilities_common.platform_sfputil_helper import natural_sort_key
@@ -32,6 +32,25 @@ def _resource_name(resource_type, resource_id):
     return "{}{}".format(resource_type, int(resource_id))
 
 
+def _parse_laser_lane_mapping(value, resource_name):
+    """Normalize one-based JSON laser IDs to zero-based CLI/API IDs."""
+    if not isinstance(value, dict):
+        raise CpoMappingError("{} laser_to_asic_lane_mapping must be an object".format(resource_name))
+    parsed = {}
+    for laser, lanes in value.items():
+        try:
+            laser_id = int(laser) - 1
+        except (TypeError, ValueError) as exc:
+            raise CpoMappingError("laser IDs must be positive integers") from exc
+        if laser_id < 0 or laser_id in parsed:
+            raise CpoMappingError("laser IDs must be unique positive integers")
+        parsed_lanes = _parse_integer_list(lanes, "{} laser {} lanes".format(resource_name, laser))
+        if not parsed_lanes:
+            raise CpoMappingError("{} laser {} must map to ASIC lanes".format(resource_name, laser))
+        parsed[laser_id] = parsed_lanes
+    return parsed
+
+
 @dataclass(frozen=True)
 class InterfaceMapping:
     port: str
@@ -41,6 +60,8 @@ class InterfaceMapping:
     oe_bank: int
     els_id: int
     els_bank: object
+    laser_ids: tuple
+    laser_to_asic_lane_mapping: dict = field(default_factory=dict)
 
     @property
     def oe_name(self):
@@ -54,7 +75,7 @@ class InterfaceMapping:
         return {
             "port": self.port, "physical_ports": list(self.physical_ports), "lanes": list(self.lanes),
             "oe": {"id": self.oe_name, "bank": self.oe_bank},
-            "els": {"id": self.els_name, "bank": self.els_bank},
+            "els": {"id": self.els_name, "bank": self.els_bank}, "laser_ids": list(self.laser_ids),
         }
 
 
@@ -88,6 +109,10 @@ class CpoMapping:
                 (self._oes if resource_type == OPTICAL_ENGINE else self._elss)[key] = device
         if not self._oes or not self._elss:
             raise CpoMappingError("devices must contain at least one OE and one ELS")
+        platform_data = cpo_data.get("platform_data", {})
+        if not isinstance(platform_data, dict) or not isinstance(platform_data.get("interfaces", {}), dict):
+            raise CpoMappingError("platform_data and its interfaces must be objects")
+        self._platform_interfaces = platform_data.get("interfaces", {})
         self._parsed_interfaces = {
             port: self._parse_interface(port, interface) for port, interface in interfaces.items()
         }
@@ -166,9 +191,24 @@ class CpoMapping:
         physical_ports = tuple(dict.fromkeys(_parse_integer_list(physical_ports, "interface {} index".format(port))))
         if not physical_ports or any(index < 0 for index in physical_ports):
             raise CpoMappingError("interface {} must contain a physical port index".format(port))
+        laser_map = _parse_laser_lane_mapping(els.get("laser_to_asic_lane_mapping", {}), els_name)
+        if laser_map:
+            laser_ids = tuple(laser for laser, lanes in sorted(laser_map.items())
+                              if set(parsed_lanes).intersection(lanes))
+            covered = {lane for laser in laser_ids for lane in laser_map[laser]}
+            if not set(parsed_lanes).issubset(covered):
+                raise CpoMappingError("interface {} has ASIC lanes without an ELS laser mapping".format(port))
+        else:
+            extension = self._platform_interfaces.get(port, {})
+            if not isinstance(extension, dict):
+                raise CpoMappingError("platform_data interface {} must be an object".format(port))
+            laser_ids = _parse_integer_list(extension.get("laser_ids"), "interface {} laser_ids".format(port))
+            if any(laser < 0 for laser in laser_ids) or len(laser_ids) != len(set(laser_ids)):
+                raise CpoMappingError("platform laser_ids must be unique non-negative integers")
         return InterfaceMapping(port, physical_ports, parsed_lanes,
                                 self._resource_index(oe_name, OPTICAL_ENGINE), oe_bank,
-                                self._resource_index(els_name, EXTERNAL_LASER_SOURCE), els_bank)
+                                self._resource_index(els_name, EXTERNAL_LASER_SOURCE), els_bank,
+                                laser_ids, laser_map)
 
     def ports(self):
         return sorted(self._parsed_interfaces, key=natural_sort_key)

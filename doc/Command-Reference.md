@@ -17152,10 +17152,9 @@ This sub-section explains the commands available for Co-Packaged Optics (CPO) de
 A CPO port is served by an Optical Engine (OE) and an External Laser Source (ELS). The platform describes the mapping between ports, OEs and ELS in `cpo.json`, and exposes each port as a CPO virtual module through `Chassis.get_cpo()`.
 
 The topology uses the community `devices` and `interfaces.associated_devices` format.
-`cpoutil` resolves interface-to-OE/ELS associations and OE lanes; it does not resolve interface-to-laser wiring.
-Laser mapping metadata, `platform_data` and `legacy_bailly_reference` are ignored by the parser.
+`platform_data` may supply zero-based, whole-interface `laser_ids` when precise laser-to-ASIC wiring is unavailable;
+these groups cannot resolve a breakout subport. `legacy_bailly_reference` is ignored by the parser.
 OE banks are local to each device and must be within its supported range; global bank numbering is not accepted.
-
 
 `cpoutil` reads the hardware directly and controls it through the platform's CPO objects; it is a debug and manual-provisioning tool. The values that xcvrd publishes to STATE_DB for CPO ports remain available through `show interfaces transceiver`. On platforms without `cpo.json`, every hardware command exits with `Error: CPO topology is unavailable for this platform`; help remains available.
 
@@ -17169,16 +17168,16 @@ These commands display per-interface CPO information. When PORT is omitted, all 
 
 `show interface speed application` displays four columns: Interface, Lane, Configured Application, and Active Application. Each application is displayed as `AppSel: Host interface / Media interface`, using the complete descriptions returned by the public API. It does not infer a numeric link speed. JSON preserves the complete `Application Advertisement` and the per-lane AppSel IDs under `Application Select Controls` and `Active Application Control Set`. Breakout subports display only their own lanes.
 
-For a breakout subport, `map` and `lane-status` select only its OE lanes. `lane-status` displays OE datapath states and the associated ELS module status; it does not assign ELS lasers or their states to interface lanes. ELS-level queries continue to report the ELS's own monitors independently of interface wiring.
+For a breakout subport, `map` and `lane-status` identify its ELS lasers only when `cpo.json` provides `laser_to_asic_lane_mapping`; otherwise the lasers are shown as `N/A (needs laser_to_asic_lane_mapping)`. `lane-status` shows a lane's laser and laser state only when the topology associates that lane with a laser.
 
 - Usage:
   ```
-  cpoutil show interface map [PORT] [--json]          # OE, bank, lanes and ELS of each interface
+  cpoutil show interface map [PORT] [--json]          # OE, bank, lanes, ELS and lasers of each interface
   cpoutil show interface presence [PORT] [--json]     # CPO virtual-module presence
   cpoutil show interface dom [PORT] [--json]          # OE and ELS information, monitors and thresholds
   cpoutil show interface tx-disable [PORT] [--json]   # per-lane Tx disable status
   cpoutil show interface speed application [PORT] [--json]  # full configured and active applications per lane
-  cpoutil show interface lane-status [PORT] [--json]  # OE datapath state and ELS module status
+  cpoutil show interface lane-status [PORT] [--json]  # OE datapath state and ELS lane state
   cpoutil show interface lpmode [PORT] [--json]       # low-power mode of the CPO virtual module
   ```
 
