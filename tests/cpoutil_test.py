@@ -2168,7 +2168,7 @@ class TestEepromBankValidation:
             self, coverage_environment, operation, page, expected_bank):
         from sonic_platform_base.sonic_xcvr.mem_maps.public.cmis.pages.page import CmisPage
 
-        data = copy.deepcopy(COMMUNITY_DATA)
+        data = copy.deepcopy(COVERAGE_CPO_DATA)
         data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = 1
         data["devices"]["oe0"]["max_banks"] = 2
         cpoutil.cpo_mapping = CpoMapping(data, COVERAGE_PORT_CONFIG)
@@ -2187,13 +2187,15 @@ class TestEepromBankValidation:
         else:
             assert coverage_environment.writes == [(address, 1, bytearray([0xFF]))]
 
-    def test_interface_shared_page_does_not_hide_capability_failure(
-            self, coverage_environment, monkeypatch):
-        monkeypatch.setattr(coverage_environment.api, "get_max_supported_banks", lambda: 0)
+    def test_interface_shared_page_does_not_hide_invalid_mapping(self, coverage_environment):
+        data = copy.deepcopy(COVERAGE_CPO_DATA)
+        data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = 7
+        data["devices"]["oe0"]["max_banks"] = 8
+        cpoutil.cpo_mapping = CpoMapping(data, COVERAGE_PORT_CONFIG)
         result = invoke_coverage(["read-eeprom", "interface", "Ethernet0", "--oe",
                                   "-n", "1", "-o", "128", "-s", "1"])
         assert result.exit_code != 0
-        assert "Invalid OE bank count 0" in result.output
+        assert "Invalid bank 7" in result.output
         assert coverage_environment.reads == []
 
     def test_full_eeprom_shared_sections_use_bank_zero(self):
