@@ -2026,6 +2026,50 @@ class TestPortConfigurationSnapshot:
         assert read.call_count == 2
 
 
+class TestCpoutilEntryPoint:
+    def test_console_entry_point_generates_bash_completion(self, monkeypatch, tmp_path):
+        import ast
+        from importlib.metadata import EntryPoint
+        from pathlib import Path
+        import runpy
+
+        repo = Path(cpoutil.__file__).resolve().parents[1]
+        setup_tree = ast.parse((repo / "setup.py").read_text())
+        entries = next(
+            ast.literal_eval(value)
+            for node in ast.walk(setup_tree) if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and key.value == "console_scripts"
+        )
+        value = next(entry.split("=", 1)[1].strip() for entry in entries
+                     if entry.split("=", 1)[0].strip() == "cpoutil")
+        entry = EntryPoint(name="cpoutil", value=value, group="console_scripts")
+        generator = runpy.run_path(str(repo / "sonic-utilities-data/generate_completions.py"))
+        distribution = types.SimpleNamespace(entry_points=[entry])
+        monkeypatch.setattr("importlib.metadata.distribution", lambda name: distribution)
+        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
+        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
+        generator["generate_completions"](str(tmp_path))
+
+        completion = tmp_path / "cpoutil"
+        assert completion.is_file(), "Registered entry point was skipped by the completion generator"
+        assert "_CPOUTIL_COMPLETE" in completion.read_text()
+        assert entry.load() is cpoutil.cli
+        initialize.assert_not_called()
+
+    @pytest.mark.parametrize("words,cword,expected", [
+        ("cpoutil sh", "1", "plain,show"),
+        ("cpoutil show inter", "2", "plain,interface"),
+    ])
+    def test_bash_completion_does_not_load_platform(self, monkeypatch, words, cword, expected):
+        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
+        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
+        result = CliRunner().invoke(cpoutil.cli, [], prog_name="cpoutil", env={
+            "_CPOUTIL_COMPLETE": "bash_complete", "COMP_WORDS": words, "COMP_CWORD": cword,
+        })
+        assert result.exit_code == 0, result.output
+        assert expected in result.output
+        initialize.assert_not_called()
 
 
 class TestHldOnlyTopology:
