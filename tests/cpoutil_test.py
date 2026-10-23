@@ -987,7 +987,7 @@ class TestCommandCoverage(object):
         assert result.exit_code != 0
         assert "Resetting OE0 (Ethernet0) ... Failed" in result.output
         assert "reprovisioning" not in result.output
-        error = "OE reset is not implemented for this platform" if unsupported else \
+        error = "Resetting OE0 (Ethernet0) is not implemented for this platform" if unsupported else \
             "Resetting OE0 (Ethernet0) failed"
         assert error in result.output
         hooked.reset.assert_called_once_with()
@@ -1003,7 +1003,7 @@ class TestCommandCoverage(object):
         hooked.reset.side_effect = NotImplementedError()
         result = invoke_coverage(["config", "els", "reset", "0"])
         assert result.exit_code != 0
-        assert "ELS reset is not implemented for this platform" in result.output
+        assert "Resetting ELS0 is not implemented for this platform" in result.output
         assert hooked.api.calls == []
 
     @pytest.mark.parametrize(
@@ -1314,7 +1314,8 @@ class TestOptionalElsApis:
         self.install(monkeypatch, cpoutil.CpoBase(None, oe, els))
         result = invoke_coverage(command)
         assert result.exit_code != 0
-        assert "{} {} is not implemented for this platform".format(label, method) in result.output
+        assert "is not implemented for this platform" in result.output
+        assert label + "0" in result.output
         assert "OK" not in result.output
         assert oe_api.calls == [] and els_api.calls == []
 
@@ -1573,7 +1574,7 @@ class TestVmoduleControls:
         result = invoke_coverage(command)
         assert result.exit_code != 0
         assert not isinstance(result.exception, OSError)
-        assert "CPO {} failed: [Errno 5] I2C read failed".format(method) in result.output
+        assert "failed: [Errno 5] I2C read failed" in result.output
         assert "already applied to" in result.output
         assert "Re-provision" not in result.output
 
@@ -1608,7 +1609,7 @@ class TestVmoduleControls:
             getattr(vmodules[3], method).side_effect = NotImplementedError()
         result = invoke_coverage(command)
         assert result.exit_code != 0
-        assert "CPO {} is not implemented for this platform".format(method) in result.output
+        assert "is not implemented for this platform" in result.output
         assert "Re-provision" not in result.output
 
     def test_failed_control_is_reported(self, vmodules):
@@ -2386,6 +2387,28 @@ def test_endpoint_lpmode_failures_do_not_fall_back_to_api(
     if failure in ("missing", "unimplemented"):
         assert label + " get_lpmode is not implemented" in result.output
     endpoint.get_api.assert_not_called()
+
+
+@pytest.mark.parametrize("command, method", [
+    (["config", "interface", "lpmode", "Ethernet0,Ethernet16", "low"], "set_lpmode"),
+    (["config", "interface", "reset", "Ethernet0,Ethernet16"], "reset"),
+    (["config", "interface", "tx-disable", "Ethernet0,Ethernet16", "true"], "tx_disable"),
+])
+@pytest.mark.parametrize("missing", [True, False])
+def test_unsupported_control_preserves_completed_targets(vmodules, command, method, missing):
+    if missing:
+        cpoutil.cpo_object_map[PORT][3] = types.SimpleNamespace()
+    else:
+        getattr(vmodules[3], method).side_effect = NotImplementedError()
+    result = invoke_coverage(command)
+    assert result.exit_code != 0
+    assert "is not implemented for this platform" in result.output
+    assert "already applied to" in result.output
+    completed_target = "Ethernet0" if method == "tx_disable" else "OE0"
+    assert "already applied to " + completed_target in result.output
+    getattr(vmodules[1], method).assert_called_once()
+    getattr(vmodules[2], method).assert_not_called()
+    assert "Re-provision" not in result.output
 
 
 @pytest.mark.parametrize("resource, endpoint_name", [("oe", "oe"), ("els", "elsfp")])

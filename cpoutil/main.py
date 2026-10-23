@@ -1287,13 +1287,17 @@ def show_interface_lpmode(port, json_output):
         with _eeprom_read_snapshot() as attach_snapshot:
             for port_name, _, cpo in get_port_cpo_objects(port):
                 attach_snapshot(getattr(cpo, "oe", None))
-                lpmode = _call_vmodule(cpo, "get_lpmode")
+                lpmode = cpo.get_lpmode()
                 if not isinstance(lpmode, bool):
                     raise CpoCommandError(
                         "CPO low-power mode is unavailable for '{}'".format(port_name)
                     )
                 records[port_name] = lpmode
-    except CpoCommandError as exc:
+    except (AttributeError, NotImplementedError) as exc:
+        raise click.ClickException(
+            "CPO get_lpmode is not implemented for this platform"
+        ) from exc
+    except (CpoCommandError, OSError) as exc:
         raise click.ClickException(str(exc))
     print_records(
         records, json_output, ("Interface", "Low-power Mode"),
@@ -1649,6 +1653,14 @@ def _run_action(message, operation):
     click.echo("{} ... ".format(message), nl=False)
     try:
         result = operation()
+    except (AttributeError, NotImplementedError) as exc:
+        click.echo("Failed")
+        raise CpoCommandError(
+            "{} is not implemented for this platform".format(message)
+        ) from exc
+    except OSError as exc:
+        click.echo("Failed")
+        raise CpoCommandError("{} failed: {}".format(message, exc)) from exc
     except Exception:
         click.echo("Failed")
         raise
@@ -1670,27 +1682,6 @@ def _single_resource(resource_type, index):
 
 def _get_interface_mapping(port):
     return get_cpo_interface_mapping(port)
-
-
-def _call_hook(target, method, label, *args):
-    """Call a platform hook, reporting a missing or unimplemented hook."""
-    function = getattr(target, method, None)
-    unsupported = "{} {} is not implemented for this platform".format(label, method)
-    if not callable(function):
-        raise CpoCommandError(unsupported)
-    try:
-        return function(*args)
-    except NotImplementedError as exc:
-        raise CpoCommandError(unsupported) from exc
-    except OSError as exc:
-        # Hardware access errors are reported like any other failed control,
-        # so a multi-target command can still name what it already applied.
-        raise CpoCommandError("{} {} failed: {}".format(label, method, exc)) from exc
-
-
-def _call_vmodule(cpo, method, *args):
-    """Call a CPO virtual-module hook on a CpoBase object."""
-    return _call_hook(cpo, method, "CPO", *args)
 
 
 def _ports_on_physical_ports(physical_ports):
@@ -1746,13 +1737,13 @@ def get_vmodule_targets(ports, per_controller):
     return sorted(targets.values(), key=lambda target: _natural_sort_key(target[0]))
 
 
-def _run_vmodule_action(targets, verb, method, *args):
-    """Apply one virtual-module hook to each target, naming the affected ports."""
+def _run_vmodule_action(targets, verb, operation):
+    """Apply a control operation once per target and report partial completion."""
     completed = []
     for label, cpo, affected_ports in targets:
         message = "{} {} ({})".format(verb, label, ", ".join(affected_ports))
         try:
-            _run_action(message, lambda cpo=cpo: _call_vmodule(cpo, method, *args))
+            _run_action(message, lambda cpo=cpo: operation(cpo))
         except CpoCommandError as exc:
             if completed:
                 raise CpoCommandError(
@@ -1783,7 +1774,7 @@ def config_interface_tx_disable(port, state):
         _run_vmodule_action(
             targets,
             "Enabling Tx-disable for" if disable else "Disabling Tx-disable for",
-            "tx_disable", disable,
+            lambda cpo: cpo.tx_disable(disable),
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
@@ -1806,7 +1797,7 @@ def config_interface_lpmode(port, mode):
         _run_vmodule_action(
             targets,
             "Enabling low-power mode for" if low_power else "Disabling low-power mode for",
-            "set_lpmode", low_power,
+            lambda cpo: cpo.set_lpmode(low_power),
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
@@ -1823,7 +1814,7 @@ def config_interface_reset(port):
     """
     try:
         targets = get_vmodule_targets(port, per_controller=True)
-        _run_vmodule_action(targets, "Resetting", "reset")
+        _run_vmodule_action(targets, "Resetting", lambda cpo: cpo.reset())
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
     click.echo(
@@ -1856,7 +1847,7 @@ def config_oe_lpmode(oe_index, mode):
                 "Enabling" if low_power else "Disabling",
                 resource_id.upper(), ", ".join(_controller_ports(resource_id)),
             ),
-            lambda: _call_hook(getattr(cpo, "oe", None), "set_lpmode", "OE", low_power),
+            lambda: cpo.oe.set_lpmode(low_power),
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
@@ -1876,7 +1867,7 @@ def config_oe_reset(oe_index):
             "Resetting {} ({})".format(
                 resource_id.upper(), ", ".join(_controller_ports(resource_id))
             ),
-            lambda: _call_hook(getattr(cpo, "oe", None), "reset", "OE"),
+            lambda: cpo.oe.reset(),
         )
         click.echo(
             "Affected ports may require application and datapath "
@@ -1908,7 +1899,7 @@ def config_els_lpmode(els_index, mode):
             "{} low-power mode for {}".format(
                 "Enabling" if low_power else "Disabling", resource_id.upper(),
             ),
-            lambda: _call_hook(getattr(cpo, "elsfp", None), "set_lpmode", "ELS", low_power),
+            lambda: cpo.elsfp.set_lpmode(low_power),
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
@@ -1922,7 +1913,7 @@ def config_els_reset(els_index):
         resource_id, cpo = _single_resource(EXTERNAL_LASER_SOURCE, els_index)
         _run_action(
             "Resetting {}".format(resource_id.upper()),
-            lambda: _call_hook(getattr(cpo, "elsfp", None), "reset", "ELS"),
+            lambda: cpo.elsfp.reset(),
         )
     except CpoCommandError as exc:
         raise click.ClickException(str(exc))
