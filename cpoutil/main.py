@@ -11,7 +11,6 @@ from tabulate import tabulate
 
 from sonic_py_common import multi_asic
 from sonic_platform_base.sonic_xcvr.cpo.cpo_base import CpoBase
-from sonic_platform_base.sonic_xcvr.api.xcvr_api import XcvrApi
 from sonic_platform_base.sonic_xcvr.optoe_eeprom_rw import OptoeEepromReadWriteMixin
 from sonic_platform_base.sonic_xcvr.xcvr_eeprom import XcvrEeprom
 from utilities_common import platform_sfputil_helper
@@ -53,12 +52,42 @@ cpo_object_map = {
 
 CPO_INFO_FIELD_MAP = {
     **CMIS_INFO_FIELD_MAP,
+    'type_abbrv_name': 'Identifier Abbreviation',
+    'vdm_supported': 'VDM Supported',
+    'cdb_supported': 'CDB Supported',
+    'specification_compliance': 'Specification Compliance',
+    'cable_length': 'Cable Length',
     'lane_count': 'Laser Count',
     'control_mode': 'Control Mode',
     'max_optical_power': 'Maximum Optical Power',
     'min_optical_power': 'Minimum Optical Power',
     'max_laser_bias': 'Maximum Laser Bias',
     'min_laser_bias': 'Minimum Laser Bias',
+}
+
+
+CPO_INFO_LANE_FIELD_MAP = {
+    "fiber_mapping": "Fiber Mapping",
+    "frequency": "Frequency",
+}
+
+CPO_DOM_MODULE_MONITOR_MAP = {
+    **DOM_MODULE_MONITOR_MAP,
+    "laser_temperature": "Laser Temperature",
+}
+
+CPO_DOM_MODULE_THRESHOLD_MAP = {
+    **DOM_MODULE_THRESHOLD_MAP,
+    "lasertemphighalarm": "LaserTempHighAlarm",
+    "lasertemplowalarm": "LaserTempLowAlarm",
+    "lasertemphighwarning": "LaserTempHighWarning",
+    "lasertemplowwarning": "LaserTempLowWarning",
+}
+
+CPO_DOM_VALUE_UNIT_MAP = {**DOM_VALUE_UNIT_MAP, "laser_temperature": "C"}
+CPO_DOM_MODULE_THRESHOLD_UNIT_MAP = {
+    **DOM_MODULE_THRESHOLD_UNIT_MAP,
+    **{key: "C" for key in CPO_DOM_MODULE_THRESHOLD_MAP if key.startswith("lasertemp")},
 }
 
 
@@ -397,8 +426,16 @@ def get_port_cpo_entries(logical_port=None):
             if cpo is None:
                 if logical_port is None:
                     continue
+                try:
+                    sfp = platform_chassis.get_sfp(physical_port)
+                except (NotImplementedError, AttributeError, IndexError):
+                    sfp = None
+                if sfp is not None:
+                    raise CpoCommandError(
+                        "Port '{}' is an SFP port; please use sfputil instead".format(port_name)
+                    )
                 raise CpoCommandError(
-                    "Port '{}' is not a CPO port".format(port_name)
+                    "No CPO or SFP object is available for port '{}'".format(port_name)
                 )
             objects.append((
                 get_physical_port_name(port_name, member_index, ganged),
@@ -527,24 +564,6 @@ def _filter_els_dom_lanes(values, lane_count):
     return filtered
 
 
-def _filter_els_monitor_lanes(values, lane_count):
-    """Remove zero-based laser monitor fields outside the ELS lane count."""
-    if lane_count is None:
-        return values
-    if isinstance(values, (list, tuple)):
-        return values[:lane_count]
-    if not isinstance(values, dict):
-        return values
-
-    filtered = {}
-    for key, value in values.items():
-        match = re.search(r"Laser(\d+)", str(key), re.IGNORECASE)
-        if match and int(match.group(1)) >= lane_count:
-            continue
-        filtered[key] = value
-    return filtered
-
-
 def _normalize_lane_values(values):
     if isinstance(values, (list, tuple)):
         ordered = list(values)
@@ -622,26 +641,44 @@ def _json_records(records):
     return json.dumps(_json_safe(_ordered_top_level(records)), indent=4, allow_nan=False)
 
 
+def _combine_cable_info(info):
+    """Use the API's cable length descriptor as the field name."""
+    if not isinstance(info, dict) or not info.get("cable_type"):
+        return info
+    combined = dict(info)
+    label = combined.pop("cable_type")
+    combined[label] = combined.pop("cable_length", "N/A")
+    return combined
+
+
+def _info_field_label(key):
+    if key in CPO_INFO_FIELD_MAP:
+        return CPO_INFO_FIELD_MAP[key]
+    match = re.fullmatch(r"(fiber_mapping|frequency)_lane(\d+)", str(key))
+    if match:
+        field, lane = match.groups()
+        return "Laser {} {}".format(lane, CPO_INFO_LANE_FIELD_MAP[field])
+    return key
+
+
 def _format_cpo_info(info):
     indent = " " * 8
     if not isinstance(info, dict):
         return ["{}EEPROM info: N/A".format(indent)]
 
+    info = _combine_cable_info(info)
     lines = []
     keys = sorted(
         info,
         key=lambda key: (
             0 if key in CPO_INFO_FIELD_MAP else 1,
-            _natural_sort_key(CPO_INFO_FIELD_MAP.get(key, key)),
+            _natural_sort_key(_info_field_label(key)),
         ),
     )
     for key in keys:
-        if key == "cable_length":
+        if key == "N/A" and info[key] == "N/A":
             continue
-        if key == "cable_type":
-            label = info.get("cable_type", CPO_INFO_FIELD_MAP[key])
-            value = info.get("cable_length", "N/A")
-        elif key == "application_advertisement":
+        if key == "application_advertisement":
             label = CPO_INFO_FIELD_MAP[key]
             values = format_application_advertisement(info[key])
             prefix = "{}{}: ".format(indent, label)
@@ -653,9 +690,12 @@ def _format_cpo_info(info):
             )
             continue
         else:
-            label = CPO_INFO_FIELD_MAP.get(key, key)
+            label = _info_field_label(key)
             value = info.get(key, "N/A")
 
+        if value in (None, "N/A", "Unknown"):
+            lines.append("{}{}: {}".format(indent, label, "N/A" if value is None else value))
+            continue
         if key in (
                 "supported_max_tx_power", "supported_min_tx_power",
                 "max_optical_power", "min_optical_power"):
@@ -685,7 +725,7 @@ def _format_oe_dom(dom_values):
         lines,
         values,
         CMIS_DOM_CHANNEL_MONITOR_MAP,
-        DOM_VALUE_UNIT_MAP,
+        CPO_DOM_VALUE_UNIT_MAP,
     )
 
     lines.append("{}ChannelThresholdValues:".format(indent))
@@ -701,24 +741,24 @@ def _format_oe_dom(dom_values):
     _append_dom_values(
         lines,
         values,
-        DOM_MODULE_MONITOR_MAP,
-        DOM_VALUE_UNIT_MAP,
+        CPO_DOM_MODULE_MONITOR_MAP,
+        CPO_DOM_VALUE_UNIT_MAP,
     )
 
     lines.append("{}ModuleThresholdValues:".format(indent))
     _append_dom_values(
         lines,
         values,
-        DOM_MODULE_THRESHOLD_MAP,
-        DOM_MODULE_THRESHOLD_UNIT_MAP,
+        CPO_DOM_MODULE_THRESHOLD_MAP,
+        CPO_DOM_MODULE_THRESHOLD_UNIT_MAP,
         alignment=15,
     )
 
     displayed_keys = set().union(
         CMIS_DOM_CHANNEL_MONITOR_MAP,
         DOM_CHANNEL_THRESHOLD_MAP,
-        DOM_MODULE_MONITOR_MAP,
-        DOM_MODULE_THRESHOLD_MAP,
+        CPO_DOM_MODULE_MONITOR_MAP,
+        CPO_DOM_MODULE_THRESHOLD_MAP,
     )
     _append_additional_dom_values(lines, values, displayed_keys)
     return lines
@@ -757,7 +797,7 @@ def _format_els_dom(dom_values):
         els_monitor_units,
     )
 
-    lines.append("{}ELSFPThresholdValues:".format(indent))
+    lines.append("{}ThresholdValues:".format(indent))
     _append_dom_values(
         lines,
         values,
@@ -1269,6 +1309,29 @@ def show_interface():
     """Display front-panel interface information."""
 
 
+@show_interface.command("presence")
+@click.argument("port", required=False)
+@output_option
+def show_interface_presence(port, json_output):
+    """Display CPO virtual-module presence for each interface."""
+    records = {}
+    try:
+        for port_name, _, cpo, logical_port in get_port_cpo_entries(port):
+            present = get_cpo_presence(cpo, port_name)
+            mapping = get_cpo_interface_mapping(logical_port)
+            records[port_name] = {"els": mapping.els_name.upper(), "present": present}
+    except CpoCommandError as exc:
+        raise click.ClickException(str(exc))
+    if json_output:
+        click.echo(_json_records(records))
+    else:
+        rows = [
+            (port_name, record["els"], "Present" if record["present"] else "Not present")
+            for port_name, record in records.items()
+        ]
+        click.echo(tabulate(rows, headers=("Interface", "ELS", "Presence")))
+
+
 @show_interface.command("map")
 @click.argument("port", required=False)
 @click.option("-j", "--json", "json_output", is_flag=True,
@@ -1334,7 +1397,7 @@ def show_interface_lpmode(port, json_output):
 def show_interface_dom(port, json_output):
     """Display CPO EEPROM information and monitoring data.
 
-    OE and ELS data retain public API field names in separate sections.
+    OE and ELS data use separate sections; cable length fields are combined.
     JSON includes presence and each endpoint's info, dom and thresholds.
     """
     records = {}
@@ -1356,14 +1419,15 @@ def show_interface_dom(port, json_output):
 
                 failures = []
                 record["oe"] = {
-                    "info": _read_dom_section(failures, "OE", "info", oe_api.get_transceiver_info),
+                    "info": _combine_cable_info(
+                        _read_dom_section(failures, "OE", "info", oe_api.get_transceiver_info)),
                     "dom": _read_dom_section(failures, "OE", "dom", oe_api.get_transceiver_dom_real_value),
                     "thresholds": _read_dom_section(
                         failures, "OE", "thresholds", oe_api.get_transceiver_threshold_info),
                 }
                 els_info = _read_dom_section(failures, "ELS", "info", els_api.get_elsfp_info)
                 record["els"] = {
-                    "info": els_info,
+                    "info": _combine_cable_info(els_info),
                     "dom": _filter_els_dom_lanes(
                         _read_dom_section(failures, "ELS", "dom", els_api.get_elsfp_dom_real_value),
                         _get_els_lane_count(els_info),
@@ -1586,38 +1650,6 @@ def show_els():
     """Display External Laser Source status."""
 
 
-@show_els.command("presence")
-@click.argument("els_index", required=False)
-@output_option
-def show_els_presence(els_index, json_output):
-    """Display physical External Laser Source presence."""
-    records = {}
-    try:
-        for resource_id, cpo in get_resource_cpo_objects(
-                EXTERNAL_LASER_SOURCE, els_index):
-            try:
-                present = cpo.elsfp.get_presence()
-            except (NotImplementedError, AttributeError) as exc:
-                raise CpoCommandError(
-                    "ELS presence is not implemented for '{}'".format(resource_id)
-                ) from exc
-            except Exception as exc:
-                raise CpoCommandError(
-                    "Failed to read ELS presence for '{}': {}".format(resource_id, exc)
-                ) from exc
-            if not isinstance(present, bool):
-                raise CpoCommandError(
-                    "ELS presence API returned invalid data for '{}'".format(resource_id)
-                )
-            records[resource_id] = present
-    except CpoCommandError as exc:
-        raise click.ClickException(str(exc))
-    print_records(
-        records, json_output, ("ELS", "Presence"),
-        boolean_values=("Present", "Not present"),
-    )
-
-
 @show_els.command("lpmode")
 @click.argument("els_index", required=False)
 @output_option
@@ -1680,40 +1712,6 @@ def show_els_temperature(els_index, json_output):
     except (CpoCommandError, NotImplementedError, AttributeError) as exc:
         raise click.ClickException(str(exc))
     print_records(records, json_output, ("ELS", "Temperature (C)"))
-
-
-@show_els.command("output-power")
-@click.argument("els_index", required=False)
-@output_option
-def show_els_output_power(els_index, json_output):
-    """Display ELS output optical power."""
-    records = {}
-    try:
-        with _eeprom_read_snapshot() as attach_snapshot:
-            for resource_id, cpo in get_resource_cpo_objects(
-                    EXTERNAL_LASER_SOURCE, els_index):
-                api = get_els_api(cpo, resource_id)
-                attach_snapshot(cpo.elsfp, api)
-                lane_count = api.get_lane_count()
-                values = _filter_els_monitor_lanes(
-                    api.get_per_lane_opt_power_monitor(),
-                    lane_count,
-                )
-                if values is None:
-                    raise CpoCommandError("ELSFP optical power is unavailable for '{}'".format(resource_id))
-                if isinstance(values, dict):
-                    records[resource_id] = {lane: XcvrApi.mw_to_dbm(value) for lane, value in values.items()}
-                else:
-                    records[resource_id] = [XcvrApi.mw_to_dbm(value) for value in values]
-    except (CpoCommandError, NotImplementedError, AttributeError) as exc:
-        raise click.ClickException(str(exc))
-    print_records(
-        records,
-        json_output,
-        ("ELS", "Output Power (dBm)"),
-        field_header="Laser",
-        floatfmt=".3f",
-    )
 
 
 def _require_success(result, action):

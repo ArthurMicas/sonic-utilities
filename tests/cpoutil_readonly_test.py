@@ -234,18 +234,21 @@ class TestDirectPlatformApiCommands(object):
         assert result.exit_code == 0
         assert json.loads(result.output) == {"oe0": "ModuleReady"}
 
-    def test_els_commands_call_public_elsfp_api(self):
+    def test_els_temperature_calls_public_elsfp_api(self):
         with mock.patch.object(self.cpo.api, "get_module_temperature", return_value=32.5):
             temperature = invoke([
                 "show", "els", "temperature", "els0", "--json"
             ])
-        power = invoke([
-            "show", "els", "output-power", "0", "--json"
-        ])
         assert json.loads(temperature.output) == {"els0": 32.5}
-        assert json.loads(power.output)["els0"][
-            "Laser0OpticalPowerMonitor"
-        ] == pytest.approx(9.590)
+
+    def test_els_output_power_command_is_not_exposed(self):
+        help_result = invoke(["show", "els", "--help"])
+        assert help_result.exit_code == 0
+        assert "output-power" not in help_result.output
+        for suffix in (["0"], ["--help"]):
+            result = invoke(["show", "els", "output-power"] + suffix)
+            assert result.exit_code == 2
+            assert "No such command 'output-power'" in result.output
 
     @pytest.mark.parametrize("value", [0.0, -5.5, 32.5])
     @pytest.mark.parametrize("index", [None, "0"])
@@ -274,99 +277,67 @@ class TestDirectPlatformApiCommands(object):
         assert result.exit_code != 0
         assert "ELSFP temperature is unavailable for 'els0'" in result.output
 
-    @pytest.mark.parametrize("power, expected", [(0.0, None), (1.0, 0.0), (10.0, 10.0)])
-    def test_els_output_power_converts_mw_to_dbm(self, power, expected):
-        with mock.patch.object(self.cpo.api, "get_per_lane_opt_power_monitor",
-                               return_value={"OptPowerMonitor1": power}):
-            result = invoke(["show", "els", "output-power", "0", "--json"])
-        assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"els0": {"OptPowerMonitor1": expected}}
-
-    def test_els_output_power_reports_read_failure(self):
-        with mock.patch.object(self.cpo.api, "get_per_lane_opt_power_monitor", return_value=None):
-            result = invoke(["show", "els", "output-power", "0"])
-        assert result.exit_code != 0
-        assert "ELSFP optical power is unavailable" in result.output
-
-    def test_els_output_power_table_uses_measurement_precision(self):
-        result = invoke(["show", "els", "output-power", "0"])
-        assert result.exit_code == 0
-        assert "Output Power (dBm)" in result.output
-        assert "9.590" in result.output
-        assert "18.500" in result.output
-
-        json_result = invoke([
-            "show", "els", "output-power", "0", "--json"
-        ])
-        assert json.loads(json_result.output)["els0"][
-            "Laser1OpticalPowerMonitor"
-        ] == pytest.approx(18.500)
-
     @pytest.mark.parametrize("present", [True, False])
-    def test_els_presence_calls_endpoint_instead_of_cpo(self, present):
+    def test_interface_presence_calls_cpo_instead_of_endpoints(self, present):
         self.cpo.oe = mock.Mock(get_presence=mock.Mock(return_value=not present))
-        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=present))
-        self.cpo.get_presence = mock.Mock(return_value=not present)
-        result = invoke(["show", "els", "presence", "0", "--json"])
+        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=not present))
+        self.cpo.get_presence = mock.Mock(return_value=present)
+        result = invoke(["show", "interface", "presence", "Ethernet0", "--json"])
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"els0": present}
-        self.cpo.get_presence.assert_not_called()
+        assert json.loads(result.output) == {"Ethernet0": {"els": "ELS0", "present": present}}
+        self.cpo.get_presence.assert_called_once_with()
         self.cpo.oe.get_presence.assert_not_called()
-        self.cpo.elsfp.get_presence.assert_called_once_with()
-        self.cpo.elsfp.get_api.assert_not_called()
+        self.cpo.elsfp.get_presence.assert_not_called()
 
-        table = invoke(["show", "els", "presence", "0"])
+        table = invoke(["show", "interface", "presence", "Ethernet0"])
         assert ("Present" if present else "Not present") in table.output
-        assert "ELS" in table.output
+        assert "Interface" in table.output
+        assert "ELS" in table.output and "ELS0" in table.output
 
-    def test_presence_lists_els_once_for_shared_interfaces_and_breakouts(self):
-        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=True))
-        result = invoke(["show", "els", "presence", "--json"])
+    def test_presence_lists_all_interfaces_and_breakouts(self):
+        result = invoke(["show", "interface", "presence", "--json"])
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output) == {"els0": True}
-        self.cpo.elsfp.get_presence.assert_called_once_with()
-        result = invoke(["show", "els", "presence", "els0", "--json"])
-        assert json.loads(result.output) == {"els0": True}
+        assert json.loads(result.output) == {
+            "Ethernet0": {"els": "ELS0", "present": True},
+            "Ethernet1": {"els": "ELS0", "present": True},
+        }
+        result = invoke(["show", "interface", "presence", "Ethernet1", "--json"])
+        assert json.loads(result.output) == {"Ethernet1": {"els": "ELS0", "present": True}}
 
+    @pytest.mark.parametrize("command", ["presence", "dom"])
     @pytest.mark.parametrize("error", [NotImplementedError(), AttributeError(), OSError("read failed")])
-    def test_dom_presence_failures_are_reported_without_endpoint_fallback(self, error):
+    def test_presence_failures_are_reported_without_endpoint_fallback(self, command, error):
         self.cpo.oe = mock.Mock()
         self.cpo.elsfp = mock.Mock()
         self.cpo.get_presence = mock.Mock(side_effect=error)
-        result = invoke(["show", "interface", "dom", "Ethernet0", "--json"])
+        path = ["show", "interface", "presence"] if command == "presence" else ["show", "interface", command]
+        result = invoke(path + ["Ethernet0", "--json"])
         assert result.exit_code != 0
         assert "CPO presence" in result.output and "Ethernet0" in result.output
         assert not self.cpo.oe.mock_calls
         assert not self.cpo.elsfp.mock_calls
 
-    @pytest.mark.parametrize("error", [NotImplementedError(), AttributeError(), OSError("read failed")])
-    def test_els_presence_failures_do_not_fall_back_to_cpo(self, error):
-        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(side_effect=error))
-        self.cpo.get_presence = mock.Mock(return_value=True)
-        result = invoke(["show", "els", "presence", "0", "--json"])
-        assert result.exit_code != 0
-        assert "ELS presence" in result.output and "els0" in result.output
-        self.cpo.get_presence.assert_not_called()
-        self.cpo.elsfp.get_api.assert_not_called()
-
     @pytest.mark.parametrize("value", [None, 1, "False"])
     def test_invalid_presence_result_is_not_reported_as_present(self, value):
-        self.cpo.elsfp = mock.Mock(get_presence=mock.Mock(return_value=value))
-        result = invoke(["show", "els", "presence", "0"])
+        self.cpo.get_presence = mock.Mock(return_value=value)
+        result = invoke(["show", "interface", "presence", "Ethernet0"])
         assert result.exit_code != 0
-        assert "ELS presence API returned invalid data" in result.output
+        assert "CPO presence API returned invalid data" in result.output
 
-    def test_inherited_presence_placeholder_is_reported_without_endpoint_reads(self):
+    @pytest.mark.parametrize("command", ["presence", "dom"])
+    def test_inherited_presence_placeholder_is_reported_without_endpoint_reads(self, command):
         cpo = cpoutil.CpoBase(None, mock.Mock(), mock.Mock())
         cpoutil.cpo_object_map[PORT][1] = cpo
-        result = invoke(["show", "interface", "dom", "Ethernet0"])
+        path = ["show", "interface", "presence"] if command == "presence" else ["show", "interface", command]
+        result = invoke(path + ["Ethernet0"])
         assert result.exit_code != 0
         assert "CPO presence is not implemented for 'Ethernet0'" in result.output
         assert not cpo.oe.mock_calls
         assert not cpo.elsfp.mock_calls
 
-    def test_interface_presence_has_been_replaced(self):
-        result = invoke(["show", "interface", "presence", "Ethernet0"])
+    @pytest.mark.parametrize("path", [["show", "presence"], ["show", "els", "presence"]])
+    def test_presence_only_exists_under_interface(self, path):
+        result = invoke(path)
         assert result.exit_code == 2
         assert "No such command 'presence'" in result.output
 
@@ -474,7 +445,7 @@ class TestDirectPlatformApiCommands(object):
         result = invoke(["show", "interface", "dom", "Ethernet0"])
         assert result.exit_code == 0, result.output
         els_section = result.output.split("    ELS:\n")[1]
-        _, thresholds = els_section.split("ELSFPThresholdValues:\n")
+        _, thresholds = els_section.split("        ThresholdValues:\n", 1)
         els_thresholds, cmis_thresholds = thresholds.split("CMISChannelThresholdValues:\n")
         assert [line.strip() for line in els_thresholds.strip().splitlines()] == [
             "TxBiasHighAlarm: 100.0mA", "TxBiasLowAlarm: 10.0mA",
@@ -927,23 +898,24 @@ class TestLaneStatusEepromSnapshot:
     @pytest.mark.parametrize("json_output", [False, True])
     def test_preserves_status_and_reduces_shared_oe_els_reads(self, tmp_path, port, json_output):
         from sonic_platform_base.sonic_xcvr.api.public.cmis import CmisApi
-        from sonic_platform_base.sonic_xcvr.api.broadcom.bailly_elsfp import BaillyElsfpApi
-        from sonic_platform_base.sonic_xcvr.codes.broadcom.bailly import BaillyCodes
-        from sonic_platform_base.sonic_xcvr.mem_maps.broadcom.bailly import BaillyMemMap, BaillyElsfpMemMap
-        from sonic_platform_base.sonic_xcvr.fields.broadcom import bailly
+        from sonic_platform_base.sonic_xcvr.api.public.elsfp import ElsfpApi
+        from sonic_platform_base.sonic_xcvr.codes.public.cmis import CmisCodes
+        from sonic_platform_base.sonic_xcvr.codes.public.elsfp import ElsfpCodes
+        from sonic_platform_base.sonic_xcvr.mem_maps.public.cmis import CmisMemMap
+        from sonic_platform_base.sonic_xcvr.mem_maps.public.cmis.elsfp import ElsfpMemMap
+        from sonic_platform_base.sonic_xcvr.fields import elsfp_consts
 
         path = tmp_path / "eeprom"
         data = bytearray(1024 * 1024)
-        oe_map = BaillyMemMap(BaillyCodes, bank=0, base_page=0)
-        els_map = BaillyElsfpMemMap(BaillyCodes, base_page=0)
-        count_code = next(code for code, count in BaillyCodes.LASER_COUNT.items() if count == 8)
-        data[els_map.get_field(bailly.LASER_COUNT).get_offset()] = count_code
-        data[els_map.get_field(bailly.MODULE_LOW_POWER_STATE).get_offset()] = 2
-        data[els_map.get_field(bailly.LASER_ACTIVE_STATUS_7_0).get_offset()] = 0x0F
+        oe_map = CmisMemMap(CmisCodes, bank=0)
+        els_map = ElsfpMemMap(ElsfpCodes, bank=0)
+        # CMIS byte 3 bits 3:1 encode ModuleLowPwr as 1.
+        data[els_map.get_field(consts.MODULE_STATE).get_offset()] = 1 << 1
+        data[els_map.get_field(elsfp_consts.LANE_ENABLE_FIELD).get_offset()] = 0x0F
         path.write_bytes(data)
         oe, els = DomOptoeEndpoint(path), DomOptoeEndpoint(path)
         oe.api = CmisApi(cpoutil.XcvrEeprom(oe.read_eeprom, oe.write_eeprom, oe_map))
-        els.api = BaillyElsfpApi(cpoutil.XcvrEeprom(els.read_eeprom, els.write_eeprom, els_map))
+        els.api = ElsfpApi(cpoutil.XcvrEeprom(els.read_eeprom, els.write_eeprom, els_map))
         self.cpo.oe, self.cpo.elsfp = oe, els
         arguments = ["show", "interface", "lane-status"]
         if port is not None:
@@ -1000,27 +972,6 @@ class TestFourReadOptimizations:
             result = invoke(["show", "els", "lpmode", "0", "--json"])
         assert result.exit_code != 0
         assert "Traceback" not in result.output
-
-    @pytest.mark.parametrize("index", [None, "0"])
-    @pytest.mark.parametrize("json_output", [False, True])
-    def test_output_power_reads_lane_count_without_identity(self, index, json_output):
-        arguments = ["show", "els", "output-power"] + ([index] if index else [])
-        if json_output:
-            arguments.append("--json")
-        values = {"Laser0OpticalPowerMonitor": 1.25, "Laser1OpticalPowerMonitor": 2.5,
-                  "Laser2OpticalPowerMonitor": 9.0}
-        with mock.patch.object(self.cpo.api, "get_lane_count", return_value=2) as count:
-            with mock.patch.object(self.cpo.api, "get_elsfp_info", side_effect=AssertionError("identity read")):
-                with mock.patch.object(self.cpo.api, "get_per_lane_opt_power_monitor", return_value=values):
-                    result = invoke(arguments)
-        assert result.exit_code == 0, result.output
-        count.assert_called_once_with()
-        assert "Laser2" not in result.output
-        if json_output:
-            assert json.loads(result.output) == {"els0": {
-                "Laser0OpticalPowerMonitor": pytest.approx(0.969),
-                "Laser1OpticalPowerMonitor": pytest.approx(3.979),
-            }}
 
     @pytest.mark.parametrize("command", ["lpmode", "tx-disable"])
     @pytest.mark.parametrize("port", [None, "Ethernet0"])

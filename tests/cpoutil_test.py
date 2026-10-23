@@ -604,7 +604,7 @@ def command_paths(command, path=()):
         yield from command_paths(child, path + (name,))
 
 
-HARDWARE_COMMANDS = [["show", "interface", "speed", "application"]] + [
+HARDWARE_COMMANDS = [["show", "interface", "presence"], ["show", "interface", "speed", "application"]] + [
     ["show", "interface", name] for name in
     ("map", "dom", "tx-disable", "lane-status")
 ] + [
@@ -612,7 +612,7 @@ HARDWARE_COMMANDS = [["show", "interface", "speed", "application"]] + [
     ("lpmode", "status", "temperature")
 ] + [
     ["show", "els", name] for name in
-    ("presence", "lpmode", "status", "temperature", "output-power")
+    ("lpmode", "status", "temperature")
 ] + [
     ["config", "interface", "tx-disable", "Ethernet0", "true"],
     ["config", "interface", "lpmode", "Ethernet0", "low"],
@@ -850,10 +850,6 @@ class TestHelperCoverage(object):
         assert "optical_power_lane3" not in cpoutil._filter_els_dom_lanes(
             {"optical_power_lane1": 1, "optical_power_lane3": 3}, 2
         )
-        assert list(cpoutil._filter_els_monitor_lanes([1, 2, 3], 2)) == [1, 2]
-        assert cpoutil._filter_els_monitor_lanes(
-            {"Laser0State": 1, "Laser2State": 2}, 2
-        ) == {"Laser0State": 1}
         assert cpoutil._select_lane_values({"DP2": 2, "DP1": 1}, (1,)) == {
             "lane01": 2
         }
@@ -935,11 +931,10 @@ class TestCommandCoverage(object):
             ["show", "oe", "lpmode"],
             ["show", "oe", "status"],
             ["show", "oe", "temperature"],
-            ["show", "els", "presence"],
+            ["show", "interface", "presence"],
             ["show", "els", "lpmode"],
             ["show", "els", "status"],
             ["show", "els", "temperature"],
-            ["show", "els", "output-power"],
         ],
     )
     def test_read_only_commands(self, coverage_environment, arguments):
@@ -2026,52 +2021,6 @@ class TestPortConfigurationSnapshot:
         assert read.call_count == 2
 
 
-class TestCpoutilEntryPoint:
-    def test_console_entry_point_generates_bash_completion(self, monkeypatch, tmp_path):
-        import ast
-        from importlib.metadata import EntryPoint
-        from pathlib import Path
-        import runpy
-
-        repo = Path(cpoutil.__file__).resolve().parents[1]
-        setup_tree = ast.parse((repo / "setup.py").read_text())
-        entries = next(
-            ast.literal_eval(value)
-            for node in ast.walk(setup_tree) if isinstance(node, ast.Dict)
-            for key, value in zip(node.keys, node.values)
-            if isinstance(key, ast.Constant) and key.value == "console_scripts"
-        )
-        value = next(entry.split("=", 1)[1].strip() for entry in entries
-                     if entry.split("=", 1)[0].strip() == "cpoutil")
-        entry = EntryPoint(name="cpoutil", value=value, group="console_scripts")
-        generator = runpy.run_path(str(repo / "sonic-utilities-data/generate_completions.py"))
-        distribution = types.SimpleNamespace(entry_points=[entry])
-        monkeypatch.setattr("importlib.metadata.distribution", lambda name: distribution)
-        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
-        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
-        generator["generate_completions"](str(tmp_path))
-
-        completion = tmp_path / "cpoutil"
-        assert completion.is_file(), "Registered entry point was skipped by the completion generator"
-        assert "_CPOUTIL_COMPLETE" in completion.read_text()
-        assert entry.load() is cpoutil.cli
-        initialize.assert_not_called()
-
-    @pytest.mark.parametrize("words,cword,expected", [
-        ("cpoutil sh", "1", "plain,show"),
-        ("cpoutil show inter", "2", "plain,interface"),
-    ])
-    def test_bash_completion_does_not_load_platform(self, monkeypatch, words, cword, expected):
-        initialize = mock.Mock(side_effect=AssertionError("completion accessed hardware"))
-        monkeypatch.setattr(cpoutil, "initialize_platform", initialize)
-        result = CliRunner().invoke(cpoutil.cli, [], prog_name="cpoutil", env={
-            "_CPOUTIL_COMPLETE": "bash_complete", "COMP_WORDS": words, "COMP_CWORD": cword,
-        })
-        assert result.exit_code == 0, result.output
-        assert expected in result.output
-        initialize.assert_not_called()
-
-
 class TestHldOnlyTopology:
     @pytest.mark.parametrize("missing", [False, True])
     def test_precise_laser_map_is_optional(self, missing):
@@ -2087,13 +2036,11 @@ class TestHldOnlyTopology:
         assert interface.laser_ids == (4, 5, 6, 7)
         assert interface.laser_to_asic_lane_mapping == {}
 
-
     def test_missing_whole_interface_group_is_also_optional(self):
         data = copy.deepcopy(CPO_DATA)
         data.pop("platform_data")
         mapping = CpoMapping(data)
         assert mapping.get_interface("Ethernet0").laser_ids == ()
-
 
     def test_legacy_reference_is_ignored(self):
         data = copy.deepcopy(CPO_DATA)
@@ -2168,7 +2115,7 @@ class TestEepromBankValidation:
             self, coverage_environment, operation, page, expected_bank):
         from sonic_platform_base.sonic_xcvr.mem_maps.public.cmis.pages.page import CmisPage
 
-        data = copy.deepcopy(COVERAGE_CPO_DATA)
+        data = copy.deepcopy(COMMUNITY_DATA)
         data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = 1
         data["devices"]["oe0"]["max_banks"] = 2
         cpoutil.cpo_mapping = CpoMapping(data, COVERAGE_PORT_CONFIG)
@@ -2187,15 +2134,13 @@ class TestEepromBankValidation:
         else:
             assert coverage_environment.writes == [(address, 1, bytearray([0xFF]))]
 
-    def test_interface_shared_page_does_not_hide_invalid_mapping(self, coverage_environment):
-        data = copy.deepcopy(COVERAGE_CPO_DATA)
-        data["interfaces"]["Ethernet0"]["associated_devices"][0]["bank"] = 7
-        data["devices"]["oe0"]["max_banks"] = 8
-        cpoutil.cpo_mapping = CpoMapping(data, COVERAGE_PORT_CONFIG)
+    def test_interface_shared_page_does_not_hide_capability_failure(
+            self, coverage_environment, monkeypatch):
+        monkeypatch.setattr(coverage_environment.api, "get_max_supported_banks", lambda: 0)
         result = invoke_coverage(["read-eeprom", "interface", "Ethernet0", "--oe",
                                   "-n", "1", "-o", "128", "-s", "1"])
         assert result.exit_code != 0
-        assert "Invalid bank 7" in result.output
+        assert "Invalid OE bank count 0" in result.output
         assert coverage_environment.reads == []
 
     def test_full_eeprom_shared_sections_use_bank_zero(self):
@@ -2236,3 +2181,163 @@ class TestEepromBankValidation:
         assert "bank" in result.output.lower()
         assert coverage_environment.reads == []
         assert coverage_environment.writes == []
+
+
+@pytest.mark.parametrize("info, expected", [
+    ({"cable_type": "Length Cable Assembly(m)", "cable_length": 4.8},
+     {"Length Cable Assembly(m)": 4.8}),
+    ({"cable_type": "Length(km)", "cable_length": 0}, {"Length(km)": 0}),
+    ({"cable_type": "Length(km)"}, {"Length(km)": "N/A"}),
+    ({"cable_length": 2}, {"cable_length": 2}),
+    ({"manufacturer": "Vendor"}, {"manufacturer": "Vendor"}),
+])
+def test_cable_info_fields_are_combined(info, expected):
+    original = copy.deepcopy(info)
+    assert cpoutil._combine_cable_info(info) == expected
+    lines = [line.strip() for line in cpoutil._format_cpo_info(info)]
+    for label, value in expected.items():
+        if label.startswith("Length"):
+            assert "{}: {}".format(label, value) in lines
+    assert not any(line.startswith("Cable Type:") for line in lines)
+    if "cable_type" in info:
+        assert not any(line.startswith("Cable Length:") for line in lines)
+    elif "cable_length" in info:
+        assert "Cable Length: {}".format(info["cable_length"]) in lines
+    assert info == original
+
+
+@pytest.mark.parametrize("endpoint", ["oe", "els"])
+def test_dom_combines_cable_fields_in_text_and_json(coverage_environment, monkeypatch, endpoint):
+    info = {"cable_type": "Length(km)", "cable_length": 2, "manufacturer": "Vendor"}
+    method = "get_transceiver_info" if endpoint == "oe" else "get_elsfp_info"
+    monkeypatch.setattr(coverage_environment.api, method, lambda: info)
+    result = invoke_coverage(["show", "interface", "dom", "Ethernet0", "--json"])
+    assert result.exit_code == 0, result.output
+    actual = json.loads(result.output)["Ethernet0"][endpoint]["info"]
+    assert actual == {"Length(km)": 2, "manufacturer": "Vendor"}
+    result = invoke_coverage(["show", "interface", "dom", "Ethernet0"])
+    assert result.exit_code == 0, result.output
+    assert "Length(km): 2" in result.output
+    assert "Cable Type:" not in result.output
+    assert "Cable Length:" not in result.output
+    assert info == {"cable_type": "Length(km)", "cable_length": 2, "manufacturer": "Vendor"}
+
+
+@pytest.mark.parametrize("command", [
+    ["show", "interface", "tx-disable"],
+    ["show", "interface", "speed", "application"],
+    ["show", "interface", "dom"],
+    ["show", "interface", "lane-status"],
+])
+def test_interface_sfp_selection_suggests_sfputil(coverage_environment, monkeypatch, command):
+    cpoutil.current_port_config["Ethernet8"] = {"index": [2], "lanes": "9,10,11,12,13,14,15,16"}
+    sfp = mock.Mock()
+    chassis = mock.Mock()
+    chassis.get_sfp.return_value = sfp
+    monkeypatch.setattr(cpoutil, "platform_chassis", chassis)
+    result = invoke_coverage(command + ["Ethernet8"])
+    assert result.exit_code != 0
+    assert "Port 'Ethernet8' is an SFP port; please use sfputil instead" in result.output
+    chassis.get_sfp.assert_called_once_with(2)
+    sfp.get_presence.assert_not_called()
+    sfp.get_xcvr_api.assert_not_called()
+    assert coverage_environment.reads == []
+
+
+@pytest.mark.parametrize("error", [None, NotImplementedError, AttributeError, IndexError])
+def test_interface_missing_objects_are_not_mislabeled_sfp(coverage_environment, monkeypatch, error):
+    cpoutil.current_port_config["Ethernet8"] = {"index": [2], "lanes": "9,10,11,12,13,14,15,16"}
+    chassis = mock.Mock()
+    chassis.get_sfp.return_value = None
+    chassis.get_sfp.side_effect = error
+    monkeypatch.setattr(cpoutil, "platform_chassis", chassis)
+    result = invoke_coverage(["show", "interface", "tx-disable", "Ethernet8"])
+    assert result.exit_code != 0
+    assert "No CPO or SFP object is available for port 'Ethernet8'" in result.output
+    assert "please use sfputil" not in result.output
+
+
+def test_global_cpo_selection_skips_sfp_without_query(coverage_environment, monkeypatch):
+    cpoutil.current_port_config["Ethernet8"] = {"index": [2], "lanes": "9,10,11,12,13,14,15,16"}
+    chassis = mock.Mock()
+    monkeypatch.setattr(cpoutil, "platform_chassis", chassis)
+    entries = cpoutil.get_port_cpo_entries()
+    assert [row[0] for row in entries] == ["Ethernet0"]
+    chassis.get_sfp.assert_not_called()
+
+
+def test_cpo_selection_does_not_query_sfp(coverage_environment, monkeypatch):
+    chassis = mock.Mock()
+    monkeypatch.setattr(cpoutil, "platform_chassis", chassis)
+    assert cpoutil.get_port_cpo_entries("Ethernet0")[0][2] is coverage_environment
+    chassis.get_sfp.assert_not_called()
+
+
+def test_invalid_interface_does_not_query_sfp(coverage_environment, monkeypatch):
+    chassis = mock.Mock()
+    monkeypatch.setattr(cpoutil, "platform_chassis", chassis)
+    result = invoke_coverage(["show", "interface", "tx-disable", "Ethernet100"])
+    assert result.exit_code != 0
+    assert "Invalid port 'Ethernet100'" in result.output
+    chassis.get_sfp.assert_not_called()
+
+
+@pytest.mark.parametrize("api_module, default_name", [
+    ("cmis", "CMIS_XCVR_INFO_DEFAULT_DICT"),
+    ("elsfp", "ELSFP_INFO_DEFAULT_DICT"),
+])
+def test_all_public_info_defaults_have_display_labels(api_module, default_name):
+    import importlib
+    module = importlib.import_module("sonic_platform_base.sonic_xcvr.api.public." + api_module)
+    fields = getattr(module, default_name)
+    assert set(fields) <= set(cpoutil.CPO_INFO_FIELD_MAP)
+
+
+@pytest.mark.parametrize("key, label", [
+    ("type_abbrv_name", "Identifier Abbreviation"),
+    ("vdm_supported", "VDM Supported"),
+    ("cdb_supported", "CDB Supported"),
+    ("specification_compliance", "Specification Compliance"),
+    ("fiber_mapping_lane9", "Laser 9 Fiber Mapping"),
+    ("frequency_lane16", "Laser 16 Frequency"),
+])
+def test_public_info_labels_preserve_api_keys(key, label):
+    info = {key: "example"}
+    assert "{}: example".format(label) in "\n".join(cpoutil._format_cpo_info(info))
+    assert info == {key: "example"}
+    assert json.loads(cpoutil._json_records(info)) == info
+
+
+def test_public_info_placeholders_have_no_units_or_na_heading():
+    info = {"max_laser_bias": "N/A", "min_optical_power": "N/A",
+            "cable_type": "N/A", "cable_length": "N/A"}
+    before = copy.deepcopy(info)
+    text = "\n".join(cpoutil._format_cpo_info(info))
+    assert "Maximum Laser Bias: N/A" in text
+    assert "Minimum Optical Power: N/A" in text
+    assert "N/AmA" not in text and "N/AdBm" not in text
+    assert "N/A: N/A" not in text
+    assert info == before
+
+
+def test_oe_public_laser_temperature_fields_are_mapped():
+    fields = {"laser_temperature": 42.5, "lasertemphighalarm": 80,
+              "lasertemplowalarm": -5, "lasertemphighwarning": 75,
+              "lasertemplowwarning": 0}
+    text = "\n".join(cpoutil._format_oe_dom(fields))
+    assert "Laser Temperature: 42.5C" in text
+    for key in fields:
+        assert key not in text
+    for label in ("LaserTempHighAlarm", "LaserTempLowAlarm",
+                  "LaserTempHighWarning", "LaserTempLowWarning"):
+        assert label in text
+    assert "AdditionalValues:" not in text
+
+
+def test_els_public_threshold_heading_and_vendor_extensions():
+    text = "\n".join(cpoutil._format_els_dom({"temperature_alarm_high": 75, "tec_current": 1.2}))
+    assert "        ThresholdValues:" in text
+    assert "ELSFPThresholdValues:" not in text
+    assert "TempHighAlarm: 75C" in text
+    assert "tec current: 1.2" in text
+    assert cpoutil._info_field_label("rlm_laser_lpmode_control") == "rlm_laser_lpmode_control"
